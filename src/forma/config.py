@@ -45,6 +45,10 @@ class Settings(BaseSettings):
         ""  # Empty = use in-memory (ephemeral), or path for persistent
     )
 
+    # CogDB configuration (for storing entities and relationships as graph)
+    cogdb_home: str = "forma_graph"  # Graph database name
+    cogdb_path_prefix: str = "./cog_data"  # Storage directory for CogDB
+
     # Model mapping (optional: map local model names to upstream models)
     # Format: "local_name:upstream_name,local_name2:upstream_name2"
     model_mapping: str = ""

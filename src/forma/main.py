@@ -34,9 +34,11 @@ async def lifespan(app: FastAPI):
     proxy = OpenAIProxy(settings)
     extractor = Extractor(settings)
     storage = Storage(
-        host=settings.chromadb_host,
-        port=settings.chromadb_port,
-        persist_directory=settings.chromadb_persist_directory,
+        chromadb_host=settings.chromadb_host,
+        chromadb_port=settings.chromadb_port,
+        chromadb_persist_directory=settings.chromadb_persist_directory,
+        cogdb_home=settings.cogdb_home,
+        cogdb_path_prefix=settings.cogdb_path_prefix,
     )
     logger.info(f"Forma proxy starting - upstream: {settings.upstream_base_url}")
     if settings.embedding_base_url:
@@ -52,8 +54,11 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Extraction will use upstream endpoint")
     # Log storage stats
-    stats = storage.get_collection_stats()
-    logger.info(f"ChromaDB collections: facts={stats['facts']}, recipes={stats['recipes']}")
+    stats = storage.get_stats()
+    logger.info(
+        f"Storage: ChromaDB facts={stats['chromadb']['facts']}, recipes={stats['chromadb']['recipes']}, "
+        f"CogDB entities={stats['cogdb']['entities']}"
+    )
     yield
     logger.info("Forma proxy shutting down")
 
@@ -107,12 +112,17 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
                     f"{len(result.relationships)} relationships, "
                     f"{len(result.facts)} facts, {len(result.recipes)} recipes"
                 )
-                # Store facts and recipes in ChromaDB
-                if result.facts or result.recipes:
-                    facts_count, recipes_count = storage.store_extraction(
-                        result.facts, result.recipes
+                # Store all extracted data
+                if result.entities or result.relationships or result.facts or result.recipes:
+                    entities_count, relationships_count, facts_count, recipes_count = (
+                        storage.store_extraction(
+                            result.entities, result.relationships, result.facts, result.recipes
+                        )
                     )
-                    logger.info(f"Stored: {facts_count} facts, {recipes_count} recipes")
+                    logger.info(
+                        f"Stored: {entities_count} entities, {relationships_count} relationships, "
+                        f"{facts_count} facts, {recipes_count} recipes"
+                    )
             elif result.parse_error:
                 logger.warning(f"Extraction parse error: {result.parse_error}")
         except Exception as e:
@@ -135,6 +145,23 @@ async def embeddings(request: Request) -> dict[str, Any]:
     """Create embeddings."""
     payload = await request.json()
     return await proxy.embeddings(payload)
+
+
+# Admin endpoints
+@app.post("/admin/clear")
+async def clear_storage() -> dict[str, Any]:
+    """Clear all stored data from ChromaDB and CogDB."""
+    result = storage.clear_all()
+    logger.info(
+        f"Storage cleared: facts={result['cleared']['facts']}, recipes={result['cleared']['recipes']}, entities={result['cleared']['entities']}"
+    )
+    return result
+
+
+@app.get("/admin/stats")
+async def get_storage_stats() -> dict[str, Any]:
+    """Get storage statistics for ChromaDB and CogDB."""
+    return storage.get_stats()
 
 
 # Error handlers
