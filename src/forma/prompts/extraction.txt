@@ -1,0 +1,27 @@
+Extract from this text. Output ONLY the sections below.
+
+=== ENTITIES ===
+Name (type) confidence: 0.X
+
+=== RELATIONSHIPS ===
+Subject -> predicate -> Object confidence: 0.X
+
+=== FACTS ===
+Factual statement. confidence: 0.X
+
+=== RECIPES ===
+Description of how to accomplish a task, including steps and requirements. confidence: 0.X
+
+=== END ===
+
+Rules:
+- Entity types: person, organization, location, concept, object, event, date, other
+- Facts: Extract all factual claims. If a fact contains pronouns (he/she/it/they), replace them with the actual entity name.
+- Recipes: Extract procedural knowledge (how-to guides, methods, workflows) as plain text. Write "N/A" if none.
+- Confidence scale:
+  - 0.9-1.0: Certain facts, directly stated as true
+  - 0.7-0.8: Likely facts, reasonable inference
+  - 0.5-0.6: Uncertain facts, speculation, rumors, or questionable claims
+  - 0.0-0.4: Very uncertain, myths, or obviously false claims
+
+Text: {{TEXT}}
