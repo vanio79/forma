@@ -26,6 +26,9 @@ class ExtractionResult:
         self.relationships: list[dict[str, Any]] = []
         self.facts: list[dict[str, Any]] = []
         self.recipes: list[dict[str, Any]] = []
+        self.entities_queries: list[str] = []
+        self.fact_query: str | None = None
+        self.recipe_query: str | None = None
         self.parse_error: str | None = None
         self._parse_response()
 
@@ -45,7 +48,7 @@ class ExtractionResult:
         try:
             # Parse entities - look for lines with (type) pattern
             entities_section = re.search(
-                r"=== ENTITIES ===\n(.*?)(?==== RELATIONSHIPS ===|=== FACTS ===|=== END ===|$)",
+                r"=== ENTITIES ===\n(.*?)(?==== RELATIONSHIPS ===|=== FACTS ===|=== RECIPES ===|=== ENTITIES_QUERY ===|=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -72,7 +75,7 @@ class ExtractionResult:
 
             # Parse relationships - look for lines with -> pattern
             rels_section = re.search(
-                r"=== RELATIONSHIPS ===\n(.*?)(?==== FACTS ===|=== END ===|$)",
+                r"=== RELATIONSHIPS ===\n(.*?)(?==== FACTS ===|=== RECIPES ===|=== ENTITIES_QUERY ===|=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -109,7 +112,7 @@ class ExtractionResult:
 
             # Parse facts - clean sentences, may be on multiple lines or combined
             facts_section = re.search(
-                r"=== FACTS ===\n(.*?)(?==== RECIPES ===|=== END ===|$)",
+                r"=== FACTS ===\n(.*?)(?==== RECIPES ===|=== ENTITIES_QUERY ===|=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -128,6 +131,9 @@ class ExtractionResult:
                         if match:
                             statement = match.group(1).strip()
                             confidence = float(match.group(2)) if match.group(2) else 0.9
+                            # Skip N/A values
+                            if statement.upper() == "N/A":
+                                continue
                             self.facts.append(
                                 {
                                     "statement": statement,
@@ -151,8 +157,12 @@ class ExtractionResult:
                         if match:
                             statement = match.group(1).strip()
                             confidence = float(match.group(2)) if match.group(2) else 0.9
-                            # Skip if statement is just "confidence: X.X" or empty
-                            if statement.lower().startswith("confidence:") or not statement:
+                            # Skip if statement is just "confidence: X.X" or empty or N/A
+                            if (
+                                statement.lower().startswith("confidence:")
+                                or not statement
+                                or statement.upper() == "N/A"
+                            ):
                                 continue
                             self.facts.append(
                                 {
@@ -163,7 +173,7 @@ class ExtractionResult:
 
             # Parse recipes - procedural knowledge as plain text
             recipes_section = re.search(
-                r"=== RECIPES ===\n(.*?)(?==== END ===|$)",
+                r"=== RECIPES ===\n(.*?)(?==== ENTITIES_QUERY ===|=== FACT_QUERY ===|=== RECIPE_QUERY ===|=== END ===|$)",
                 response,
                 re.DOTALL,
             )
@@ -184,6 +194,10 @@ class ExtractionResult:
                     description = re.sub(r"\s*confidence:\s*[\d.]+\s*$", "", block)
                     description = description.strip()
 
+                    # Skip N/A values
+                    if description.upper() == "N/A":
+                        continue
+
                     if description:
                         self.recipes.append(
                             {
@@ -191,6 +205,42 @@ class ExtractionResult:
                                 "confidence": max(0.0, min(1.0, confidence)),
                             }
                         )
+
+            # Parse entities query - list of entity names to query
+            entities_query_section = re.search(
+                r"=== ENTITIES_QUERY ===\n(.*?)(?==== FACT_QUERY ===|=== RECIPE_QUERY ===|=== END ===|$)",
+                response,
+                re.DOTALL,
+            )
+            if entities_query_section:
+                entities_query_text = entities_query_section.group(1).strip()
+                for line in entities_query_text.split("\n"):
+                    line = line.strip()
+                    if not line or line == "N/A":
+                        continue
+                    self.entities_queries.append(line)
+
+            # Parse fact query - single natural language query
+            fact_query_section = re.search(
+                r"=== FACT_QUERY ===\n(.*?)(?==== RECIPE_QUERY ===|=== END ===|$)",
+                response,
+                re.DOTALL,
+            )
+            if fact_query_section:
+                fact_query_text = fact_query_section.group(1).strip()
+                if fact_query_text and fact_query_text != "N/A":
+                    self.fact_query = fact_query_text
+
+            # Parse recipe query - single natural language query
+            recipe_query_section = re.search(
+                r"=== RECIPE_QUERY ===\n(.*?)(?==== END ===|$)",
+                response,
+                re.DOTALL,
+            )
+            if recipe_query_section:
+                recipe_query_text = recipe_query_section.group(1).strip()
+                if recipe_query_text and recipe_query_text != "N/A":
+                    self.recipe_query = recipe_query_text
 
         except Exception as e:
             self.parse_error = f"Text parse error: {e}"
@@ -203,6 +253,9 @@ class ExtractionResult:
             or len(self.relationships) > 0
             or len(self.facts) > 0
             or len(self.recipes) > 0
+            or len(self.entities_queries) > 0
+            or self.fact_query is not None
+            or self.recipe_query is not None
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -212,8 +265,19 @@ class ExtractionResult:
             "relationships": self.relationships,
             "facts": self.facts,
             "recipes": self.recipes,
+            "entities_queries": self.entities_queries,
+            "fact_query": self.fact_query,
+            "recipe_query": self.recipe_query,
             "parse_error": self.parse_error,
         }
+
+    def has_queries(self) -> bool:
+        """Check if extraction has any queries to execute."""
+        return (
+            len(self.entities_queries) > 0
+            or self.fact_query is not None
+            or self.recipe_query is not None
+        )
 
 
 class Extractor:

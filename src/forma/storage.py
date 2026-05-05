@@ -1,8 +1,9 @@
 """Storage for extracted data: ChromaDB for facts/recipes, CogDB for entities/relationships."""
 
 import logging
+import math
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import chromadb
@@ -14,6 +15,9 @@ logger = logging.getLogger(__name__)
 # ChromaDB collection names
 FACTS_COLLECTION = "facts_v1"
 RECIPES_COLLECTION = "recipes_v1"
+
+# Token estimation: roughly 4 characters per token
+CHARS_PER_TOKEN = 4
 
 
 class Storage:
@@ -41,6 +45,75 @@ class Storage:
         # Initialize CogDB for entities and relationships
         self.graph = self._create_cogdb_graph(cogdb_home, cogdb_path_prefix)
         logger.info(f"CogDB initialized - graph: {cogdb_home}")
+
+    def _calculate_chroma_score(
+        self, confidence: float, distance: float, timestamp: str, decay_days: float = 30.0
+    ) -> float:
+        """
+        Calculate composite score for ChromaDB results (facts, recipes).
+
+        Score = confidence * similarity * time_factor
+
+        - similarity = 1 - distance (cosine distance, lower = more similar)
+        - time_factor = exponential decay based on age (newer = higher)
+        """
+        try:
+            similarity = 1.0 - distance
+            # Calculate age in hours
+            if timestamp:
+                ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                age_hours = (now - ts).total_seconds() / 3600
+            else:
+                age_hours = 0
+            # Exponential decay: half-life = decay_days
+            time_factor = math.exp(-age_hours / (decay_days * 24))
+            return confidence * similarity * time_factor
+        except Exception:
+            return confidence * (1.0 - distance)
+
+    def _calculate_cog_score(
+        self, confidence: float, timestamp: str, decay_days: float = 30.0
+    ) -> float:
+        """
+        Calculate composite score for CogDB results (relationships).
+
+        Score = confidence * time_factor
+
+        - time_factor = exponential decay based on age (newer = higher)
+        """
+        try:
+            # Calculate age in hours
+            if timestamp:
+                ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                age_hours = (now - ts).total_seconds() / 3600
+            else:
+                age_hours = 0
+            # Exponential decay: half-life = decay_days
+            time_factor = math.exp(-age_hours / (decay_days * 24))
+            return confidence * time_factor
+        except Exception:
+            return confidence
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count from text length."""
+        return len(text) // CHARS_PER_TOKEN
+
+    def _format_relationship_for_context(self, rel: dict[str, Any]) -> str:
+        """Format a relationship for context string."""
+        return f"- {rel['subject']} → {rel['predicate']} → {rel['object']}"
+
+    def _format_fact_for_context(self, fact: dict[str, Any]) -> str:
+        """Format a fact for context string."""
+        return f"- {fact['statement']}"
+
+    def _format_recipe_for_context(self, recipe: dict[str, Any]) -> str:
+        """Format a recipe for context string, truncating if too long."""
+        desc = recipe["description"]
+        if len(desc) > 200:
+            desc = desc[:200] + "..."
+        return f"- {desc}"
 
     def _create_chroma_client(
         self, host: str, port: int, persist_directory: str
@@ -115,9 +188,12 @@ class Storage:
 
         Each relationship is stored as:
         - subject -> predicate -> object (triple)
-        - Plus confidence and timestamp as properties on subject
+        - Plus confidence and timestamp as properties
 
-        Returns number of relationships stored.
+        Deduplicates by checking if relationship already exists.
+        Updates timestamp and keeps higher confidence if duplicate.
+
+        Returns number of relationships stored/updated.
         """
         if not relationships:
             return 0
@@ -134,17 +210,35 @@ class Storage:
             if not subject.strip() or not predicate.strip() or not obj.strip():
                 continue
 
-            # Store relationship triple
-            self.graph.put(subject, predicate, obj)
-            # Store confidence on the relationship edge (via subject)
-            self.graph.put(f"{subject}_{predicate}_{obj}", "confidence", str(confidence))
-            # Store timestamp
-            self.graph.put(f"{subject}_{predicate}_{obj}", "extracted_at", timestamp)
+            rel_key = f"{subject}_{predicate}_{obj}"
 
-            count += 1
+            # Check if relationship already exists
+            existing_result = self.graph.v(subject).out(predicate).all()
+            existing_obj = None
+            if existing_result.get("result"):
+                existing_obj = existing_result["result"][0].get("id")
+
+            if existing_obj == obj:
+                # Relationship exists - update timestamp and keep higher confidence
+                conf_result = self.graph.v(rel_key).out("confidence").all()
+                existing_conf = (
+                    float(conf_result.get("result", [{}])[0].get("id", "0.9"))
+                    if conf_result.get("result")
+                    else 0.9
+                )
+                # Keep higher confidence
+                final_conf = max(existing_conf, confidence)
+                self.graph.put(rel_key, "confidence", str(final_conf))
+                self.graph.put(rel_key, "extracted_at", timestamp)
+            else:
+                # New relationship - store it
+                self.graph.put(subject, predicate, obj)
+                self.graph.put(rel_key, "confidence", str(confidence))
+                self.graph.put(rel_key, "extracted_at", timestamp)
+                count += 1
 
         if count > 0:
-            logger.info(f"Stored {count} relationships to CogDB")
+            logger.info(f"Stored {count} new relationships to CogDB")
 
         return count
 
@@ -157,6 +251,7 @@ class Storage:
         - metadata: confidence, timestamp, source_type
         - id: auto-generated
 
+        Deduplicates by checking for similar existing facts (distance < 0.05).
         Returns number of facts stored.
         """
         if not facts:
@@ -166,13 +261,30 @@ class Storage:
         documents = []
         metadatas = []
         ids = []
+        duplicate_threshold = 0.05  # Very similar = duplicate
 
         for i, fact in enumerate(facts):
             statement = fact.get("statement", "")
             confidence = fact.get("confidence", 0.9)
 
-            if not statement.strip():
+            # Skip empty statements and N/A values
+            if not statement.strip() or statement.strip().upper() == "N/A":
                 continue
+
+            # Check for near-duplicate existing facts
+            try:
+                existing = self.facts_collection.query(
+                    query_texts=[statement],
+                    n_results=1,
+                )
+                if existing.get("distances") and existing["distances"][0]:
+                    min_distance = existing["distances"][0][0]
+                    if min_distance < duplicate_threshold:
+                        # Near-duplicate found - skip
+                        logger.debug(f"Skipping duplicate fact: {statement[:50]}...")
+                        continue
+            except Exception:
+                pass  # If query fails, proceed to add
 
             fact_id = f"fact_{timestamp}_{i}"
 
@@ -205,6 +317,7 @@ class Storage:
         - metadata: confidence, timestamp, source_type
         - id: auto-generated
 
+        Deduplicates by checking for similar existing recipes (distance < 0.05).
         Returns number of recipes stored.
         """
         if not recipes:
@@ -214,13 +327,30 @@ class Storage:
         documents = []
         metadatas = []
         ids = []
+        duplicate_threshold = 0.05  # Very similar = duplicate
 
         for i, recipe in enumerate(recipes):
             description = recipe.get("description", "")
             confidence = recipe.get("confidence", 0.9)
 
-            if not description.strip():
+            # Skip empty descriptions and N/A values
+            if not description.strip() or description.strip().upper() == "N/A":
                 continue
+
+            # Check for near-duplicate existing recipes
+            try:
+                existing = self.recipes_collection.query(
+                    query_texts=[description],
+                    n_results=1,
+                )
+                if existing.get("distances") and existing["distances"][0]:
+                    min_distance = existing["distances"][0][0]
+                    if min_distance < duplicate_threshold:
+                        # Near-duplicate found - skip
+                        logger.debug(f"Skipping duplicate recipe: {description[:50]}...")
+                        continue
+            except Exception:
+                pass  # If query fails, proceed to add
 
             recipe_id = f"recipe_{timestamp}_{i}"
 
@@ -358,7 +488,9 @@ class Storage:
         """
         Query relationships from CogDB.
 
-        If subject is provided, returns outgoing relationships from that subject.
+        If subject is provided, returns both:
+        - Outgoing relationships (entity as subject)
+        - Incoming relationships (entity as object)
         Otherwise returns all relationships.
 
         Returns list of relationships.
@@ -366,7 +498,7 @@ class Storage:
         relationships = []
         try:
             if subject:
-                # Get outgoing edges from subject
+                # Get outgoing edges from subject (entity -> predicate -> object)
                 result = self.graph.v(subject).out().all("e")
                 edges = result.get("result", [])
                 for edge in edges:
@@ -385,31 +517,64 @@ class Storage:
                                     "object": obj,
                                 }
                             )
+
+                # Get incoming edges by scanning all entities
+                # Find relationships where entity appears as object
+                scan_result = self.graph.scan(n_results, "v")
+                vertices = scan_result.get("result", [])
+                for vertex in vertices:
+                    v_name = vertex.get("id")
+                    # Skip metadata vertices
+                    if (
+                        v_name.startswith("202")  # timestamps
+                        or v_name
+                        in ["0.9", "1.0", "person", "organization", "other", "concept", "object"]
+                        or "_" in v_name
+                        and "->" not in v_name
+                    ):
+                        continue
+                    # Check if this vertex has outgoing relationships to our subject
+                    try:
+                        out_result = self.graph.v(v_name).out().all("e")
+                        out_edges = out_result.get("result", [])
+                        for edge in out_edges:
+                            edge_labels = edge.get("edges", [])
+                            for pred in edge_labels:
+                                if pred in ["type", "confidence", "extracted_at"]:
+                                    continue
+                                # Check if this edge points to our subject
+                                obj_result = self.graph.v(v_name).out(pred).all()
+                                if obj_result.get("result"):
+                                    for obj_item in obj_result["result"]:
+                                        obj = obj_item.get("id")
+                                        if obj == subject:
+                                            relationships.append(
+                                                {
+                                                    "subject": v_name,
+                                                    "predicate": pred,
+                                                    "object": subject,
+                                                }
+                                            )
+                    except Exception:
+                        continue
             else:
                 # Scan all vertices and find relationships
                 scan_result = self.graph.scan(n_results, "v")
                 vertices = scan_result.get("result", [])
                 for vertex in vertices:
                     v_name = vertex.get("id")
-                    # Skip metadata vertices:
-                    # - timestamps (start with year)
-                    # - confidence values (numeric strings)
-                    # - type values
-                    # - relationship tracking vertices (contain underscores with relationship info)
+                    # Skip metadata vertices
                     if (
-                        v_name.startswith("202")  # timestamps
+                        v_name.startswith("202")
                         or v_name
                         in ["0.9", "1.0", "person", "organization", "other", "concept", "object"]
                         or "_" in v_name
-                        and "->"
-                        not in v_name  # relationship tracking vertices like "Bob_is a_TechCorp"
+                        and "->" not in v_name
                     ):
                         continue
-                    # Check if this vertex has a type (meaning it's an entity)
                     type_result = self.graph.v(v_name).out("type").all()
                     if not type_result.get("result"):
                         continue
-                    # Query relationships from this entity
                     rels = self.query_relationships(subject=v_name, n_results=5)
                     relationships.extend(rels)
         except Exception as e:
@@ -480,3 +645,230 @@ class Storage:
                 "entities": stats_before["cogdb"]["entities"] - stats_after["cogdb"]["entities"],
             },
         }
+
+    def retrieve_context(
+        self,
+        entities_queries: list[str],
+        fact_query: str | None,
+        recipe_query: str | None,
+        token_budget: int = 1500,
+        min_confidence: float = 0.5,
+        max_distance: float = 0.7,
+        query_limit: int = 100,
+        decay_days: float = 30.0,
+    ) -> dict[str, Any]:
+        """
+        Retrieve context from storage based on queries with composite scoring and token budget.
+
+        Composite scoring:
+        - ChromaDB (facts, recipes): confidence * similarity * time_factor
+        - CogDB (relationships): confidence * time_factor
+
+        Token budget: stops adding items when estimated token count reaches budget.
+
+        Returns dict with 'relationships', 'facts', 'recipes', 'tokens_used', 'scores' lists.
+        """
+        all_items = []  # Pool of all scored items
+
+        # Query CogDB for entity relationships
+        for entity in entities_queries:
+            try:
+                entity_rels = self.query_relationships(subject=entity, n_results=query_limit)
+                for rel in entity_rels:
+                    rel_key = f"{rel['subject']}_{rel['predicate']}_{rel['object']}"
+                    ts_result = self.graph.v(rel_key).out("extracted_at").all()
+                    timestamp = (
+                        ts_result.get("result", [{}])[0].get("id", "")
+                        if ts_result.get("result")
+                        else ""
+                    )
+                    conf_result = self.graph.v(rel_key).out("confidence").all()
+                    confidence = (
+                        float(conf_result.get("result", [{}])[0].get("id", "0.9"))
+                        if conf_result.get("result")
+                        else 0.9
+                    )
+
+                    if confidence >= min_confidence:
+                        score = self._calculate_cog_score(confidence, timestamp, decay_days)
+                        formatted = self._format_relationship_for_context(rel)
+                        all_items.append(
+                            {
+                                "type": "relationship",
+                                "data": {
+                                    "subject": rel["subject"],
+                                    "predicate": rel["predicate"],
+                                    "object": rel["object"],
+                                    "confidence": confidence,
+                                    "timestamp": timestamp,
+                                    "source": entity,
+                                },
+                                "score": score,
+                                "formatted": formatted,
+                                "tokens": self._estimate_tokens(formatted),
+                            }
+                        )
+            except Exception as e:
+                logger.debug(f"Query entity relationships error for {entity}: {e}")
+
+        # Query ChromaDB for facts
+        if fact_query:
+            try:
+                fact_results = self.query_facts(fact_query, n_results=query_limit)
+                for fact in fact_results:
+                    confidence = fact.get("metadata", {}).get("confidence", 0.9)
+                    distance = fact.get("distance", 1.0) or 1.0
+                    timestamp = fact.get("metadata", {}).get("timestamp", "")
+
+                    if confidence >= min_confidence and distance <= max_distance:
+                        score = self._calculate_chroma_score(
+                            confidence, distance, timestamp, decay_days
+                        )
+                        formatted = self._format_fact_for_context({"statement": fact["document"]})
+                        all_items.append(
+                            {
+                                "type": "fact",
+                                "data": {
+                                    "statement": fact["document"],
+                                    "confidence": confidence,
+                                    "timestamp": timestamp,
+                                    "distance": distance,
+                                },
+                                "score": score,
+                                "formatted": formatted,
+                                "tokens": self._estimate_tokens(formatted),
+                            }
+                        )
+            except Exception as e:
+                logger.debug(f"Query facts error: {e}")
+
+        # Query ChromaDB for recipes
+        if recipe_query:
+            try:
+                recipe_results = self.query_recipes(recipe_query, n_results=query_limit)
+                for recipe in recipe_results:
+                    confidence = recipe.get("metadata", {}).get("confidence", 0.9)
+                    distance = recipe.get("distance", 1.0) or 1.0
+                    timestamp = recipe.get("metadata", {}).get("timestamp", "")
+
+                    if confidence >= min_confidence and distance <= max_distance:
+                        score = self._calculate_chroma_score(
+                            confidence, distance, timestamp, decay_days
+                        )
+                        formatted = self._format_recipe_for_context(
+                            {"description": recipe["document"]}
+                        )
+                        all_items.append(
+                            {
+                                "type": "recipe",
+                                "data": {
+                                    "description": recipe["document"],
+                                    "confidence": confidence,
+                                    "timestamp": timestamp,
+                                    "distance": distance,
+                                },
+                                "score": score,
+                                "formatted": formatted,
+                                "tokens": self._estimate_tokens(formatted),
+                            }
+                        )
+            except Exception as e:
+                logger.debug(f"Query recipes error: {e}")
+
+        # Deduplicate items (keep highest score for duplicates)
+        seen_keys: dict[str, int] = {}  # key -> index in all_items
+        for i, item in enumerate(all_items):
+            # Create unique key for each type
+            if item["type"] == "relationship":
+                key = f"rel:{item['data']['subject']}|{item['data']['predicate']}|{item['data']['object']}"
+            elif item["type"] == "fact":
+                key = f"fact:{item['data']['statement']}"
+            elif item["type"] == "recipe":
+                key = f"recipe:{item['data']['description'][:100]}"  # First 100 chars for key
+            else:
+                key = f"{item['type']}:{i}"
+
+            if key in seen_keys:
+                # Keep the one with higher score
+                existing_idx = seen_keys[key]
+                if item["score"] > all_items[existing_idx]["score"]:
+                    all_items[existing_idx] = item
+            else:
+                seen_keys[key] = i
+
+        # Remove duplicates by keeping only items that are in seen_keys
+        deduped_items = [all_items[i] for i in sorted(seen_keys.values())]
+
+        # Sort deduplicated items by composite score DESC
+        deduped_items.sort(key=lambda x: x["score"], reverse=True)
+
+        # Build context within token budget
+        relationships = []
+        facts = []
+        recipes = []
+        scores = {"relationships": [], "facts": [], "recipes": []}
+        tokens_used = 0
+
+        # Reserve tokens for headers
+        header_tokens = self._estimate_tokens(
+            "Relevant context from memory:\nKnown relationships:\nKnown facts:\nKnown procedures:\n\n"
+        )
+        tokens_used += header_tokens
+
+        for item in deduped_items:
+            if tokens_used + item["tokens"] > token_budget:
+                break
+
+            tokens_used += item["tokens"]
+            if item["type"] == "relationship":
+                relationships.append(item["data"])
+                scores["relationships"].append(item["score"])
+            elif item["type"] == "fact":
+                facts.append(item["data"])
+                scores["facts"].append(item["score"])
+            elif item["type"] == "recipe":
+                recipes.append(item["data"])
+                scores["recipes"].append(item["score"])
+
+        logger.info(
+            f"Retrieved {len(relationships)} relationships, {len(facts)} facts, {len(recipes)} recipes "
+            f"using {tokens_used}/{token_budget} tokens"
+        )
+
+        return {
+            "relationships": relationships,
+            "facts": facts,
+            "recipes": recipes,
+            "tokens_used": tokens_used,
+            "scores": scores,
+        }
+
+    def format_context_for_prompt(self, context: dict[str, Any]) -> str:
+        """
+        Format retrieved context for prompt augmentation.
+
+        Returns a formatted string suitable for prepending to user message.
+        """
+        lines = []
+
+        if context.get("relationships"):
+            lines.append("Known relationships:")
+            for rel in context["relationships"]:
+                lines.append(f"- {rel['subject']} → {rel['predicate']} → {rel['object']}")
+
+        if context.get("facts"):
+            lines.append("Known facts:")
+            for fact in context["facts"]:
+                lines.append(f"- {fact['statement']}")
+
+        if context.get("recipes"):
+            lines.append("Known procedures:")
+            for recipe in context["recipes"]:
+                desc = recipe["description"]
+                if len(desc) > 200:
+                    desc = desc[:200] + "..."
+                lines.append(f"- {desc}")
+
+        if lines:
+            return "Relevant context from memory:\n" + "\n".join(lines) + "\n\n"
+        return ""

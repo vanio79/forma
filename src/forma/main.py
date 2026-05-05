@@ -1,7 +1,10 @@
 """FastAPI application entry point."""
 
+import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -20,10 +23,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Logs directory
+LOGS_DIR = Path(__file__).parent.parent.parent / "logs"
+
 # Global instances
 proxy: OpenAIProxy
 extractor: Extractor
 storage: Storage
+
+
+def _log_context_retrieval(
+    entities_queries: list[str],
+    fact_query: str | None,
+    recipe_query: str | None,
+    context: dict[str, Any],
+    augmented_prompt: str | None,
+) -> None:
+    """Log context retrieval to file for debugging."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "queries": {
+            "entities_queries": entities_queries,
+            "fact_query": fact_query,
+            "recipe_query": recipe_query,
+        },
+        "retrieved": {
+            "relationships": context.get("relationships", []),
+            "facts": context.get("facts", []),
+            "recipes": context.get("recipes", []),
+        },
+        "tokens_used": context.get("tokens_used", 0),
+        "scores": context.get("scores", {}),
+        "augmented_prompt": augmented_prompt,
+    }
+    log_file = LOGS_DIR / "retrievals.jsonl"
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+        logger.debug(
+            f"Logged retrieval: {len(context.get('relationships', []))} relationships, "
+            f"{len(context.get('facts', []))} facts, {len(context.get('recipes', []))} recipes, "
+            f"{context.get('tokens_used', 0)} tokens"
+        )
+    except Exception as e:
+        logger.error(f"Failed to log retrieval: {e}")
 
 
 @asynccontextmanager
@@ -96,7 +140,7 @@ async def list_models() -> dict[str, Any]:
 
 @app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(request: Request) -> dict[str, Any] | StreamingResponse:
-    """Create chat completion with synchronous extraction."""
+    """Create chat completion with synchronous extraction and RAG context."""
     payload = await request.json()
     messages = payload.get("messages", [])
 
@@ -123,6 +167,59 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
                         f"Stored: {entities_count} entities, {relationships_count} relationships, "
                         f"{facts_count} facts, {recipes_count} recipes"
                     )
+
+                # Retrieve context if extraction has queries
+                if result.has_queries():
+                    context = storage.retrieve_context(
+                        entities_queries=result.entities_queries,
+                        fact_query=result.fact_query,
+                        recipe_query=result.recipe_query,
+                    )
+                    if (
+                        context.get("relationships")
+                        or context.get("facts")
+                        or context.get("recipes")
+                    ):
+                        context_str = storage.format_context_for_prompt(context)
+                        logger.info(
+                            f"Retrieved context: {len(context['relationships'])} relationships, "
+                            f"{len(context['facts'])} facts, {len(context['recipes'])} recipes"
+                        )
+                        # Augment first user message with context
+                        augmented_prompt = None
+                        for msg in messages:
+                            if msg.get("role") == "user":
+                                content = msg.get("content", "")
+                                if isinstance(content, str):
+                                    augmented_prompt = context_str + content
+                                    msg["content"] = augmented_prompt
+                                elif isinstance(content, list):
+                                    # Handle multi-modal content - prepend to first text part
+                                    for part in content:
+                                        if isinstance(part, dict) and part.get("type") == "text":
+                                            augmented_prompt = context_str + part.get("text", "")
+                                            part["text"] = augmented_prompt
+                                            break
+                                break
+
+                        # Log the retrieval for debugging
+                        _log_context_retrieval(
+                            result.entities_queries,
+                            result.fact_query,
+                            result.recipe_query,
+                            context,
+                            augmented_prompt,
+                        )
+                    else:
+                        # Log empty retrieval for debugging
+                        _log_context_retrieval(
+                            result.entities_queries,
+                            result.fact_query,
+                            result.recipe_query,
+                            context,
+                            None,
+                        )
+
             elif result.parse_error:
                 logger.warning(f"Extraction parse error: {result.parse_error}")
         except Exception as e:

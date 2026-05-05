@@ -1,24 +1,43 @@
 Extract from this text. Output ONLY the sections below.
 
 === ENTITIES ===
-Name (type) confidence: 0.X
+Entity Name (type) confidence: 0.X
 
 === RELATIONSHIPS ===
-Subject -> predicate -> Object confidence: 0.X
+Subject Entity -> predicate -> Object Entity confidence: 0.X
 
 === FACTS ===
-Factual statement. confidence: 0.X
+Standalone factual statement with NO pronouns - use entity names instead. confidence: 0.X
 
 === RECIPES ===
-Description of how to accomplish a task, including steps and requirements. confidence: 0.X
+Standalone procedural description. Internal pronouns (you, this, it) allowed within the recipe context. confidence: 0.X
+
+=== ENTITIES_QUERY ===
+Entity name to search for related relationships.
+Entity name to search for related relationships.
+
+=== FACT_QUERY ===
+Natural language query to find relevant facts.
+
+=== RECIPE_QUERY ===
+Natural language query to find relevant procedural knowledge or how-to guides.
 
 === END ===
 
 Rules:
+- NO external pronouns in Entities, Relationships, and Facts:
+  - Forbidden pronouns: he, she, they, his, her, their, him, them, we, us, our, I, me, my, who (referring to entities)
+  - ALL entity references must use the actual entity name (e.g., "Ingrid works at Forma" not "She works at Forma")
 - Entity types: person, organization, location, concept, object, event, date, other
-- Facts: Extract all factual claims. If a fact contains pronouns (he/she/it/they), replace them with the actual entity name.
-- Recipes: Extract procedural knowledge (how-to guides, methods, workflows) as plain text. Write "N/A" if none.
-- Confidence scale:
+- Entities: Extract named entities (people, organizations, locations, etc.) using their actual names, not pronouns.
+- Relationships: Subject and Object must be entity names, not pronouns.
+- Facts: Extract all factual claims with entity names. Each fact must be standalone and understandable without external context. NO pronouns referring to entities outside the fact.
+- Recipes: Extract procedural knowledge (how-to guides, methods, workflows) as plain text. Internal pronouns (you, this, it, that) are allowed within the recipe itself. Each recipe must be self-contained. Write "N/A" if none.
+- Entities Query: List entity names to look up their relationships in the graph. One entity per line. Write "N/A" if no entities to query.
+- Fact Query: A natural language question to retrieve relevant facts from memory. Write "N/A" if no relevant query.
+- Recipe Query: A natural language question to retrieve relevant how-to guides or procedures from memory. Write "N/A" if no relevant query.
+- Queries do NOT have confidence scores.
+- Confidence scale (for facts, entities, relationships, recipes only):
   - 0.9-1.0: Certain facts, directly stated as true
   - 0.7-0.8: Likely facts, reasonable inference
   - 0.5-0.6: Uncertain facts, speculation, rumors, or questionable claims
