@@ -121,6 +121,9 @@ async def lifespan(app: FastAPI) -> Any:
         chromadb_persist_directory=settings.chromadb_persist_directory,
         cogdb_home=settings.cogdb_home,
         cogdb_path_prefix=settings.cogdb_path_prefix,
+        chromadb_max_file_handles=settings.chromadb_max_file_handles,
+        cogdb_index_capacity=settings.cogdb_index_capacity,
+        cogdb_l2_cache_size=settings.cogdb_l2_cache_size,
     )
     logger.info(f"Forma proxy starting - upstream: {settings.upstream_base_url}")
     if settings.embedding_base_url:

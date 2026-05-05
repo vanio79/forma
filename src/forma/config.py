@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     cogdb_home: str = "forma_graph"  # Graph database name
     cogdb_path_prefix: str = "./cog_data"  # Storage directory for CogDB
 
+    # File descriptor limits to prevent exhaustion under load
+    chromadb_max_file_handles: int = 256  # Max open files for ChromaDB
+    cogdb_index_capacity: int = 50000  # Index hash table size (lower = fewer indices)
+    cogdb_l2_cache_size: int = 50000  # L2 cache entries (lower = fewer cached handles)
+
     # Model mapping (optional: map local model names to upstream models)
     # Format: "local_name:upstream_name,local_name2:upstream_name2"
     model_mapping: str = ""

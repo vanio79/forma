@@ -8,8 +8,9 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import chromadb
+from chromadb.config import Settings as ChromaSettings
 from cog import config as cog_config
-from cog.torque import Graph
+from cog.torque import CogConfig, Graph
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +32,14 @@ class Storage:
         chromadb_persist_directory: str = "",
         cogdb_home: str = "forma_graph",
         cogdb_path_prefix: str = "./cog_data",
+        chromadb_max_file_handles: int = 256,
+        cogdb_index_capacity: int = 50000,
+        cogdb_l2_cache_size: int = 50000,
     ) -> None:
-        """Initialize ChromaDB and CogDB."""
+        """Initialize ChromaDB and CogDB with configurable limits."""
         # Initialize ChromaDB for facts and recipes
         self.chroma_client = self._create_chroma_client(
-            chromadb_host, chromadb_port, chromadb_persist_directory
+            chromadb_host, chromadb_port, chromadb_persist_directory, chromadb_max_file_handles
         )
         self.facts_collection = self._get_or_create_collection(FACTS_COLLECTION)
         self.recipes_collection = self._get_or_create_collection(RECIPES_COLLECTION)
@@ -44,7 +48,9 @@ class Storage:
         )
 
         # Initialize CogDB for entities and relationships
-        self.graph = self._create_cogdb_graph(cogdb_home, cogdb_path_prefix)
+        self.graph = self._create_cogdb_graph(
+            cogdb_home, cogdb_path_prefix, cogdb_index_capacity, cogdb_l2_cache_size
+        )
         logger.info(f"CogDB initialized - graph: {cogdb_home}")
 
     def _calculate_chroma_score(
@@ -116,11 +122,19 @@ class Storage:
             desc = desc[:200] + "..."
         return f"- {desc}"
 
-    def _create_chroma_client(self, host: str, port: int, persist_directory: str) -> Any:
-        """Create ChromaDB client."""
+    def _create_chroma_client(
+        self, host: str, port: int, persist_directory: str, max_file_handles: int
+    ) -> Any:
+        """Create ChromaDB client with file descriptor limit."""
         if persist_directory:
             logger.info(f"Using persistent ChromaDB at: {persist_directory}")
-            return chromadb.PersistentClient(path=persist_directory)
+            settings = ChromaSettings(
+                is_persistent=True,
+                persist_directory=persist_directory,
+                chroma_server_nofile=max_file_handles,
+                anonymized_telemetry=False,
+            )
+            return chromadb.PersistentClient(path=persist_directory, settings=settings)
         # Try server mode first, fall back to in-memory ephemeral
         try:
             logger.info(f"Connecting to ChromaDB server at {host}:{port}")
@@ -130,7 +144,12 @@ class Storage:
                 f"Could not connect to ChromaDB server at {host}:{port}, "
                 "falling back to in-memory ephemeral client"
             )
-            return chromadb.EphemeralClient()
+            settings = ChromaSettings(
+                is_persistent=False,
+                chroma_server_nofile=max_file_handles,
+                anonymized_telemetry=False,
+            )
+            return chromadb.EphemeralClient(settings=settings)
 
     def _get_or_create_collection(self, name: str) -> Any:
         """Get or create a ChromaDB collection with cosine similarity."""
@@ -142,16 +161,27 @@ class Storage:
             ),
         )
 
-    def _create_cogdb_graph(self, graph_name: str, path_prefix: str) -> Graph:
-        """Create CogDB graph for entities and relationships."""
+    def _create_cogdb_graph(
+        self, graph_name: str, path_prefix: str, index_capacity: int, l2_cache_size: int
+    ) -> Graph:
+        """Create CogDB graph with configurable limits."""
         # Ensure storage directory exists
         os.makedirs(path_prefix, exist_ok=True)
 
-        # Configure CogDB storage location
-        cog_config.COG_PATH_PREFIX = path_prefix
-        cog_config.COG_HOME = graph_name
+        # Create CogConfig with file descriptor limits
+        # Lower index_capacity and l2_cache_size reduce the number of open index files
+        cog_cfg = CogConfig(
+            COG_PATH_PREFIX=path_prefix,
+            COG_HOME=graph_name,
+            INDEX_CAPACITY=index_capacity,
+            LEVEL_2_CACHE_SIZE=l2_cache_size,
+        )
 
-        return Graph(graph_name)
+        logger.info(
+            f"CogDB config - index_capacity={index_capacity}, l2_cache_size={l2_cache_size}"
+        )
+
+        return Graph(graph_name, config=cog_cfg)
 
     def store_entities(self, entities: list[dict[str, Any]]) -> int:
         """
