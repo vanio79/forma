@@ -256,19 +256,43 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
     # Step 4: Forward to upstream
     response = await proxy.chat_completions(payload)
 
-    # Step 5: Store extracted data in background (fire-and-forget)
-    if extraction_result and (
-        extraction_result.entities
-        or extraction_result.relationships
-        or extraction_result.facts
-        or extraction_result.recipes
-    ):
+    # Step 5: Extract facts from assistant response (non-streaming only)
+    assistant_facts: list[dict[str, Any]] = []
+    if isinstance(response, dict) and extractor.settings.extractor_model_name:
+        try:
+            assistant_content = ""
+            for choice in response.get("choices", []):
+                msg = choice.get("message", {})
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        assistant_content = content
+                    break
+            if assistant_content:
+                logger.info("Extracting facts from assistant response...")
+                assistant_result = await extractor.extract_from_text_async(
+                    assistant_content
+                )
+                if assistant_result.facts:
+                    logger.info(
+                        f"Extracted {len(assistant_result.facts)} facts from assistant response"
+                    )
+                    assistant_facts = assistant_result.facts
+        except Exception as e:
+            logger.error(f"Assistant response extraction error: {e}")
+
+    # Step 6: Store all extracted data in background (fire-and-forget)
+    entities = extraction_result.entities if extraction_result else []
+    relationships = extraction_result.relationships if extraction_result else []
+    facts = (extraction_result.facts if extraction_result else []) + assistant_facts
+    recipes = extraction_result.recipes if extraction_result else []
+    if entities or relationships or facts or recipes:
         asyncio.create_task(
             _store_extraction_background(
-                extraction_result.entities,
-                extraction_result.relationships,
-                extraction_result.facts,
-                extraction_result.recipes,
+                entities,
+                relationships,
+                facts,
+                recipes,
             )
         )
 

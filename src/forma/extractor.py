@@ -385,23 +385,25 @@ class Extractor:
         return asyncio.run(self.extract_from_messages_async(messages))
 
     async def extract_from_messages_async(self, messages: list[dict[str, str]]) -> ExtractionResult:
-        """Async extraction from all user messages."""
-        # Collect all user messages
-        user_texts = []
+        """Async extraction from all user and assistant messages."""
+        texts = []
         for msg in messages:
-            if msg.get("role") == "user":
+            role = msg.get("role")
+            if role in ("user", "assistant"):
                 content = msg.get("content", "")
                 if isinstance(content, str):
-                    user_texts.append(content)
+                    prefix = "User:" if role == "user" else "Assistant:"
+                    texts.append(f"{prefix}\n{content}")
                 elif isinstance(content, list):
                     # Handle multi-modal content (text parts)
                     for part in content:
                         if isinstance(part, dict) and part.get("type") == "text":
-                            user_texts.append(part.get("text", ""))
+                            prefix = "User:" if role == "user" else "Assistant:"
+                            texts.append(f"{prefix}\n{part.get('text', '')}")
 
-        if not user_texts:
+        if not texts:
             return ExtractionResult("")
 
-        # Combine all user messages for extraction
-        combined_text = "\n\n---\n\n".join(user_texts)
+        # Combine all messages for extraction
+        combined_text = "\n\n---\n\n".join(texts)
         return await self.extract_from_text_async(combined_text)
