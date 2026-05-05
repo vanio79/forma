@@ -148,6 +148,7 @@ async def lifespan(app: FastAPI) -> Any:
     logger.info("Forma proxy shutting down")
     await proxy.close()
     extractor.close()
+    storage.close()
     if _retrieval_log_file is not None:
         with contextlib.suppress(Exception):
             _retrieval_log_file.close()
@@ -291,9 +292,7 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
                     break
             if assistant_content:
                 logger.info("Extracting facts from assistant response...")
-                assistant_result = await extractor.extract_from_text_async(
-                    assistant_content
-                )
+                assistant_result = await extractor.extract_from_text_async(assistant_content)
                 if assistant_result.facts:
                     logger.info(
                         f"Extracted {len(assistant_result.facts)} facts from assistant response"

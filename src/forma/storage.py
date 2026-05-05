@@ -116,9 +116,7 @@ class Storage:
             desc = desc[:200] + "..."
         return f"- {desc}"
 
-    def _create_chroma_client(
-        self, host: str, port: int, persist_directory: str
-    ) -> Any:
+    def _create_chroma_client(self, host: str, port: int, persist_directory: str) -> Any:
         """Create ChromaDB client."""
         if persist_directory:
             logger.info(f"Using persistent ChromaDB at: {persist_directory}")
@@ -614,6 +612,24 @@ class Storage:
             "chromadb": chroma_stats,
             "cogdb": {"entities": entity_count},
         }
+
+    def close(self) -> None:
+        """Close all storage connections and release file handles."""
+        # Close ChromaDB client
+        try:
+            if hasattr(self.chroma_client, "close"):
+                self.chroma_client.close()
+                logger.info("ChromaDB client closed")
+        except Exception as e:
+            logger.error(f"Failed to close ChromaDB: {e}")
+
+        # Close CogDB graph
+        try:
+            if hasattr(self.graph, "close"):
+                self.graph.close()
+                logger.info("CogDB graph closed")
+        except Exception as e:
+            logger.error(f"Failed to close CogDB: {e}")
 
     def clear_all(self) -> dict[str, Any]:
         """
