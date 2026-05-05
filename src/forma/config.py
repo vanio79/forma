@@ -39,8 +39,10 @@ class Settings(BaseSettings):
     extractor_timeout: float = 120.0  # 2 minutes for extraction (may need more time)
 
     # ChromaDB configuration (for storing extracted facts and recipes)
+    # Note: port is only used when persist_directory is empty (HttpClient mode)
+    # Default port 8001 to avoid conflict with Forma server port 8000
     chromadb_host: str = "localhost"
-    chromadb_port: int = 8000
+    chromadb_port: int = 8001
     chromadb_persist_directory: str = (
         ""  # Empty = use in-memory (ephemeral), or path for persistent
     )

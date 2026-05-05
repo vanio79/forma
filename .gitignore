@@ -66,3 +66,21 @@ chroma_data/
 
 # CogDB local storage
 cog_data/
+
+# Benchmark outputs
+benchmarks/**/results/
+benchmarks/**/__pycache__/
+benchmarks/**/*.log
+# Large dataset files (>50MB)
+benchmarks/**/data/*_s_*.json
+
+# Test outputs and experimental scripts
+test_results*.json
+test_results*.txt
+test_retrieval*.py
+feed_dataset.py
+format_*.py
+show_retrieval.py
+
+# External dataset documentation
+dataset/

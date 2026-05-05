@@ -592,7 +592,7 @@ class Storage:
 
         # CogDB stats (count unique vertices)
         try:
-            scan_result = self.graph.scan(1000, "v")
+            scan_result = self.graph.scan(5000, "v")
             entity_count = len(scan_result.get("result", []))
         except Exception:
             entity_count = 0

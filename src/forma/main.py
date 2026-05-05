@@ -1,5 +1,6 @@
 """FastAPI application entry point."""
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -68,6 +69,26 @@ def _log_context_retrieval(
         )
     except Exception as e:
         logger.error(f"Failed to log retrieval: {e}")
+
+
+async def _store_extraction_background(
+    entities: list[dict[str, Any]],
+    relationships: list[dict[str, Any]],
+    facts: list[dict[str, Any]],
+    recipes: list[dict[str, Any]],
+) -> None:
+    """Background task to store extracted data."""
+    try:
+        if entities or relationships or facts or recipes:
+            entities_count, relationships_count, facts_count, recipes_count = (
+                storage.store_extraction(entities, relationships, facts, recipes)
+            )
+            logger.info(
+                f"Stored (background): {entities_count} entities, {relationships_count} relationships, "
+                f"{facts_count} facts, {recipes_count} recipes"
+            )
+    except Exception as e:
+        logger.error(f"Background storage error: {e}")
 
 
 @asynccontextmanager
@@ -140,12 +161,22 @@ async def list_models() -> dict[str, Any]:
 
 @app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(request: Request) -> dict[str, Any] | StreamingResponse:
-    """Create chat completion with synchronous extraction and RAG context."""
+    """
+    Create chat completion with extraction, retrieval, and RAG context.
+
+    Pipeline:
+    1. Extract entities/facts/recipes/queries from messages
+    2. Retrieve context from storage using extracted queries
+    3. Augment prompt with retrieved context
+    4. Forward to upstream model
+    5. Store extracted data in background (async, fire-and-forget)
+    """
     payload = await request.json()
     messages = payload.get("messages", [])
 
-    # Synchronous extraction before forwarding
-    # This allows us to modify the prompt based on extracted data later
+    extraction_result = None
+
+    # Step 1: Extract entities, facts, recipes, and queries
     if messages and extractor.settings.extractor_model_name:
         try:
             logger.info(f"Extracting from {len(messages)} messages...")
@@ -156,78 +187,88 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
                     f"{len(result.relationships)} relationships, "
                     f"{len(result.facts)} facts, {len(result.recipes)} recipes"
                 )
-                # Store all extracted data
-                if result.entities or result.relationships or result.facts or result.recipes:
-                    entities_count, relationships_count, facts_count, recipes_count = (
-                        storage.store_extraction(
-                            result.entities, result.relationships, result.facts, result.recipes
-                        )
-                    )
-                    logger.info(
-                        f"Stored: {entities_count} entities, {relationships_count} relationships, "
-                        f"{facts_count} facts, {recipes_count} recipes"
-                    )
-
-                # Retrieve context if extraction has queries
-                if result.has_queries():
-                    context = storage.retrieve_context(
-                        entities_queries=result.entities_queries,
-                        fact_query=result.fact_query,
-                        recipe_query=result.recipe_query,
-                    )
-                    if (
-                        context.get("relationships")
-                        or context.get("facts")
-                        or context.get("recipes")
-                    ):
-                        context_str = storage.format_context_for_prompt(context)
-                        logger.info(
-                            f"Retrieved context: {len(context['relationships'])} relationships, "
-                            f"{len(context['facts'])} facts, {len(context['recipes'])} recipes"
-                        )
-                        # Augment first user message with context
-                        augmented_prompt = None
-                        for msg in messages:
-                            if msg.get("role") == "user":
-                                content = msg.get("content", "")
-                                if isinstance(content, str):
-                                    augmented_prompt = context_str + content
-                                    msg["content"] = augmented_prompt
-                                elif isinstance(content, list):
-                                    # Handle multi-modal content - prepend to first text part
-                                    for part in content:
-                                        if isinstance(part, dict) and part.get("type") == "text":
-                                            augmented_prompt = context_str + part.get("text", "")
-                                            part["text"] = augmented_prompt
-                                            break
-                                break
-
-                        # Log the retrieval for debugging
-                        _log_context_retrieval(
-                            result.entities_queries,
-                            result.fact_query,
-                            result.recipe_query,
-                            context,
-                            augmented_prompt,
-                        )
-                    else:
-                        # Log empty retrieval for debugging
-                        _log_context_retrieval(
-                            result.entities_queries,
-                            result.fact_query,
-                            result.recipe_query,
-                            context,
-                            None,
-                        )
-
+                extraction_result = result  # Save for background storage
             elif result.parse_error:
                 logger.warning(f"Extraction parse error: {result.parse_error}")
         except Exception as e:
-            # Don't fail the request if extraction fails
             logger.error(f"Extraction error: {e}")
 
-    # Forward to upstream
-    return await proxy.chat_completions(payload)
+    # Step 2: Retrieve context from storage using extracted queries
+    if extraction_result and extraction_result.has_queries():
+        try:
+            context = storage.retrieve_context(
+                entities_queries=extraction_result.entities_queries,
+                fact_query=extraction_result.fact_query,
+                recipe_query=extraction_result.recipe_query,
+            )
+
+            # Step 3: Augment prompt with retrieved context
+            if context.get("relationships") or context.get("facts") or context.get("recipes"):
+                context_str = storage.format_context_for_prompt(context)
+                logger.info(
+                    f"Retrieved context: {len(context['relationships'])} relationships, "
+                    f"{len(context['facts'])} facts, {len(context['recipes'])} recipes, "
+                    f"{context.get('tokens_used', 0)} tokens"
+                )
+
+                # Augment first user message with context
+                augmented_prompt = None
+                for msg in messages:
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            augmented_prompt = context_str + content
+                            msg["content"] = augmented_prompt
+                        elif isinstance(content, list):
+                            # Handle multi-modal content - prepend to first text part
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    augmented_prompt = context_str + part.get("text", "")
+                                    part["text"] = augmented_prompt
+                                    break
+                        break
+
+                # Log the retrieval for debugging
+                _log_context_retrieval(
+                    extraction_result.entities_queries,
+                    extraction_result.fact_query,
+                    extraction_result.recipe_query,
+                    context,
+                    augmented_prompt,
+                )
+            else:
+                # Log empty retrieval for debugging
+                _log_context_retrieval(
+                    extraction_result.entities_queries,
+                    extraction_result.fact_query,
+                    extraction_result.recipe_query,
+                    context,
+                    None,
+                )
+                logger.debug("No relevant context retrieved")
+        except Exception as e:
+            logger.error(f"Retrieval error: {e}")
+
+    # Step 4: Forward to upstream
+    response = await proxy.chat_completions(payload)
+
+    # Step 5: Store extracted data in background (fire-and-forget)
+    if extraction_result and (
+        extraction_result.entities
+        or extraction_result.relationships
+        or extraction_result.facts
+        or extraction_result.recipes
+    ):
+        asyncio.create_task(
+            _store_extraction_background(
+                extraction_result.entities,
+                extraction_result.relationships,
+                extraction_result.facts,
+                extraction_result.recipes,
+            )
+        )
+
+    return response
 
 
 @app.post("/v1/completions", response_model=None)

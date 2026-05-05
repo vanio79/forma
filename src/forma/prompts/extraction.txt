@@ -7,7 +7,7 @@ Entity Name (type) confidence: 0.X
 Subject Entity -> predicate -> Object Entity confidence: 0.X
 
 === FACTS ===
-Standalone factual statement with NO pronouns - use entity names instead. confidence: 0.X
+Standalone factual statement - transform "I/me/my" to "The user", use other entity names. confidence: 0.X
 
 === RECIPES ===
 Standalone procedural description. Internal pronouns (you, this, it) allowed within the recipe context. confidence: 0.X
@@ -25,15 +25,20 @@ Natural language query to find relevant procedural knowledge or how-to guides.
 === END ===
 
 Rules:
-- NO external pronouns in Entities, Relationships, and Facts:
-  - Forbidden pronouns: he, she, they, his, her, their, him, them, we, us, our, I, me, my, who (referring to entities)
-  - ALL entity references must use the actual entity name (e.g., "Ingrid works at Forma" not "She works at Forma")
-- Entity types: person, organization, location, concept, object, event, date, other
-- Entities: Extract named entities (people, organizations, locations, etc.) using their actual names, not pronouns.
-- Relationships: Subject and Object must be entity names, not pronouns.
-- Facts: Extract all factual claims with entity names. Each fact must be standalone and understandable without external context. NO pronouns referring to entities outside the fact.
+- Transform pronouns to entity references in Entities, Relationships, and Facts:
+  - Transform first-person pronouns (I, me, my, mine) to "The user" (e.g., "I live in Berlin" → "The user lives in Berlin")
+  - Forbidden third-party pronouns: he, she, they, his, her, their, him, them, we, us, our, who (referring to other entities)
+  - ALL entity references must use actual names or "The user" (e.g., "The user works at Forma" not "I work at Forma")
+- Entity types: person, organization, location, concept, technology, methodology, architecture, software, hardware, platform, tool, format, model, dataset, standard, object, event, date, other
+- Entities: Extract ALL entities - both named entities AND conceptual entities:
+  - Named entities: people (The user, Ingrid, John), organizations (HuggingFace), locations (San Francisco)
+  - Conceptual entities: technologies (ZeroGPU), methodologies (fine-tuning, quantization), architectures (MoE, Transformer), software (Stable Diffusion, llama.cpp), hardware (H100 GPU, AMD Radeon), platforms (ROCm, CUDA), tools (Git, Docker), formats (GGUF, safetensors), models (GPT-4, Gemma), datasets (Common Crawl), standards (ISO 8601)
+  - IMPORTANT: Even if the text only mentions a concept briefly (e.g., "quantization", "RAG pipeline", "consent flows"), extract it as an entity so we can retrieve related knowledge
+  - Transform "I/me/my" to "The user", use actual names for other entities
+- Relationships: Subject and Object must be entity names (including "The user"), not third-party pronouns.
+- Facts: Extract all factual claims. Transform "I/me/my" to "The user". Each fact must be standalone and understandable without external context. NO third-party pronouns referring to entities.
 - Recipes: Extract procedural knowledge (how-to guides, methods, workflows) as plain text. Internal pronouns (you, this, it, that) are allowed within the recipe itself. Each recipe must be self-contained. Write "N/A" if none.
-- Entities Query: List entity names to look up their relationships in the graph. One entity per line. Write "N/A" if no entities to query.
+- Entities Query: List ALL entity names (both named and conceptual) that appear in the text. One entity per line. These drive graph relationship retrieval. Write "N/A" if no entities to query.
 - Fact Query: A natural language question to retrieve relevant facts from memory. Write "N/A" if no relevant query.
 - Recipe Query: A natural language question to retrieve relevant how-to guides or procedures from memory. Write "N/A" if no relevant query.
 - Queries do NOT have confidence scores.
@@ -42,5 +47,16 @@ Rules:
   - 0.7-0.8: Likely facts, reasonable inference
   - 0.5-0.6: Uncertain facts, speculation, rumors, or questionable claims
   - 0.0-0.4: Very uncertain, myths, or obviously false claims
+
+Example Entities (for a task about quantization):
+GGUF format (format) confidence: 0.95
+quantization (methodology) confidence: 0.95
+Q4_K_M (format variant) confidence: 0.9
+llama.cpp (software) confidence: 0.9
+GPU memory (hardware component) confidence: 0.85
+
+Example Facts (first-person transformation):
+"I prefer Q4_K_M for my models" → "The user prefers Q4_K_M for the user's models"
+"My favorite quantization method is Q4_K_M" → "The user's favorite quantization method is Q4_K_M"
 
 Text: {{TEXT}}
