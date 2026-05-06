@@ -1,0 +1,436 @@
+"""Request tracking database for Forma web UI.
+
+Tracks requests, extractions, and retrievals for the Web UI.
+Uses SQLite for lightweight, file-based storage.
+"""
+
+import json
+import logging
+import sqlite3
+import threading
+import uuid
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class RequestTracker:
+    """SQLite-based tracker for Forma operations."""
+
+    # SQL schema - simplified design
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS requests (
+        id TEXT PRIMARY KEY,
+        model TEXT,
+        user_prompt TEXT,
+        history TEXT,
+        extraction_response TEXT,
+        extraction_ms REAL DEFAULT 0.0,
+        augmented_prompt TEXT,
+        agent_response TEXT,
+        timestamp INTEGER NOT NULL
+    );
+    
+    CREATE TABLE IF NOT EXISTS extractions (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        extraction_type TEXT,
+        data TEXT,
+        confidence REAL DEFAULT 0.9
+    );
+    
+    CREATE TABLE IF NOT EXISTS retrievals (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        retrieval_type TEXT,
+        data TEXT,
+        confidence REAL DEFAULT 0.9,
+        score REAL DEFAULT 0.0
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_extractions_request_id ON extractions(request_id);
+    CREATE INDEX IF NOT EXISTS idx_retrievals_request_id ON retrievals(request_id);
+    """
+
+    def __init__(self, db_path: str = "./tracker_data/forma_tracker.db", max_records: int = 100):
+        """Initialize the tracker.
+
+        Args:
+            db_path: Path to SQLite database file
+            max_records: Maximum number of request records to keep (older ones are pruned)
+        """
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_records = max_records
+        self._local = threading.local()
+
+        # Initialize database
+        self._init_db()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get thread-local database connection."""
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            self._local.conn = sqlite3.connect(
+                str(self.db_path), check_same_thread=False, timeout=30.0
+            )
+            self._local.conn.row_factory = sqlite3.Row
+        return self._local.conn
+
+    @contextmanager
+    def _transaction(self):
+        """Transaction context manager."""
+        conn = self._get_connection()
+        try:
+            yield conn
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Transaction error: {e}")
+            raise
+
+    def _init_db(self):
+        """Initialize database schema."""
+        with self._transaction() as conn:
+            conn.executescript(self.SCHEMA)
+        logger.info(f"Tracker database initialized at {self.db_path}")
+
+    def _prune_old_records(self):
+        """Remove records exceeding max_records limit."""
+        with self._transaction() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+            if count > self.max_records:
+                # Find cutoff timestamp
+                cutoff = conn.execute(
+                    "SELECT timestamp FROM requests ORDER BY timestamp DESC LIMIT 1 OFFSET ?",
+                    (self.max_records,),
+                ).fetchone()
+
+                if cutoff:
+                    cutoff_ts = cutoff[0]
+                    # Delete old records from all tables
+                    old_ids = conn.execute(
+                        "SELECT id FROM requests WHERE timestamp < ?", (cutoff_ts,)
+                    ).fetchall()
+                    old_ids = [row[0] for row in old_ids]
+
+                    if old_ids:
+                        placeholders = ",".join("?" * len(old_ids))
+                        conn.execute(
+                            f"DELETE FROM extractions WHERE request_id IN ({placeholders})", old_ids
+                        )
+                        conn.execute(
+                            f"DELETE FROM retrievals WHERE request_id IN ({placeholders})", old_ids
+                        )
+                        conn.execute(f"DELETE FROM requests WHERE id IN ({placeholders})", old_ids)
+                        logger.debug(f"Pruned {len(old_ids)} old records")
+
+    def _format_history(self, messages: list[dict]) -> str:
+        """Format chat messages as human-readable history."""
+        lines = []
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                lines.append(f"{role.upper()}: {content}")
+            elif isinstance(content, list):
+                # Handle multi-modal content
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        lines.append(f"{role.upper()}: {part.get('text', '')}")
+        return "\n\n".join(lines)
+
+    def _format_extraction_data(self, item: dict, extraction_type: str) -> str:
+        """Format extraction item as human-readable string."""
+        if extraction_type == "entity":
+            return f"{item.get('name', 'Unknown')} ({item.get('type', 'unknown')})"
+        elif extraction_type == "relationship":
+            return f"{item.get('subject', '')} -> {item.get('predicate', '')} -> {item.get('object', '')}"
+        elif extraction_type == "fact":
+            return item.get("statement", item.get("fact", str(item)))
+        elif extraction_type == "recipe":
+            return item.get("description", str(item))
+        return str(item)
+
+    def record_request(
+        self,
+        model: str,
+        user_prompt: str,
+        messages: list[dict],
+        extraction_response: str = "",
+        extraction_ms: float = 0.0,
+        augmented_prompt: str = "",
+        agent_response: str = "",
+    ) -> str:
+        """Record a request with all associated data.
+
+        Returns:
+            The request ID (UUID)
+        """
+        request_id = str(uuid.uuid4())
+        timestamp = int(datetime.utcnow().timestamp())
+        history = self._format_history(messages)
+
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO requests (id, model, user_prompt, history, extraction_response,
+                                      extraction_ms, augmented_prompt, agent_response, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    model,
+                    user_prompt,
+                    history,
+                    extraction_response,
+                    extraction_ms,
+                    augmented_prompt,
+                    agent_response,
+                    timestamp,
+                ),
+            )
+
+        self._prune_old_records()
+        return request_id
+
+    def record_extraction(
+        self,
+        request_id: str,
+        extraction_type: str,
+        data: str,
+        confidence: float = 0.9,
+    ) -> str:
+        """Record a single extraction item."""
+        extraction_id = str(uuid.uuid4())
+
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO extractions (id, request_id, extraction_type, data, confidence)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (extraction_id, request_id, extraction_type, data, confidence),
+            )
+
+        return extraction_id
+
+    def record_extractions_batch(
+        self,
+        request_id: str,
+        entities: list[dict],
+        relationships: list[dict],
+        facts: list[dict],
+        recipes: list[dict],
+    ) -> int:
+        """Record all extractions for a request.
+
+        Returns:
+            Number of extractions recorded
+        """
+        count = 0
+        with self._transaction() as conn:
+            for entity in entities:
+                extraction_id = str(uuid.uuid4())
+                data = self._format_extraction_data(entity, "entity")
+                confidence = entity.get("confidence", 0.9)
+                conn.execute(
+                    "INSERT INTO extractions (id, request_id, extraction_type, data, confidence) VALUES (?, ?, ?, ?, ?)",
+                    (extraction_id, request_id, "entity", data, confidence),
+                )
+                count += 1
+
+            for rel in relationships:
+                extraction_id = str(uuid.uuid4())
+                data = self._format_extraction_data(rel, "relationship")
+                confidence = rel.get("confidence", 0.9)
+                conn.execute(
+                    "INSERT INTO extractions (id, request_id, extraction_type, data, confidence) VALUES (?, ?, ?, ?, ?)",
+                    (extraction_id, request_id, "relationship", data, confidence),
+                )
+                count += 1
+
+            for fact in facts:
+                extraction_id = str(uuid.uuid4())
+                data = self._format_extraction_data(fact, "fact")
+                confidence = fact.get("confidence", 0.9)
+                conn.execute(
+                    "INSERT INTO extractions (id, request_id, extraction_type, data, confidence) VALUES (?, ?, ?, ?, ?)",
+                    (extraction_id, request_id, "fact", data, confidence),
+                )
+                count += 1
+
+            for recipe in recipes:
+                extraction_id = str(uuid.uuid4())
+                data = self._format_extraction_data(recipe, "recipe")
+                confidence = recipe.get("confidence", 0.9)
+                conn.execute(
+                    "INSERT INTO extractions (id, request_id, extraction_type, data, confidence) VALUES (?, ?, ?, ?, ?)",
+                    (extraction_id, request_id, "recipe", data, confidence),
+                )
+                count += 1
+
+        return count
+
+    def record_retrieval(
+        self,
+        request_id: str,
+        retrieval_type: str,
+        data: str,
+        confidence: float = 0.9,
+        score: float = 0.0,
+    ) -> str:
+        """Record a single retrieval item."""
+        retrieval_id = str(uuid.uuid4())
+
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO retrievals (id, request_id, retrieval_type, data, confidence, score)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (retrieval_id, request_id, retrieval_type, data, confidence, score),
+            )
+
+        return retrieval_id
+
+    def record_retrievals_batch(
+        self,
+        request_id: str,
+        results: list[dict],
+    ) -> int:
+        """Record all retrievals for a request.
+
+        Args:
+            results: List of result dicts with type, data, confidence, score
+
+        Returns:
+            Number of retrievals recorded
+        """
+        count = 0
+        with self._transaction() as conn:
+            for result in results:
+                retrieval_id = str(uuid.uuid4())
+                retrieval_type = result.get("type", "unknown")
+                data = self._format_extraction_data(result.get("data", {}), retrieval_type)
+                confidence = result.get("data", {}).get("confidence", 0.9)
+                score = result.get("data", {}).get("score", 0.0)
+                conn.execute(
+                    "INSERT INTO retrievals (id, request_id, retrieval_type, data, confidence, score) VALUES (?, ?, ?, ?, ?, ?)",
+                    (retrieval_id, request_id, retrieval_type, data, confidence, score),
+                )
+                count += 1
+
+        return count
+
+    def get_requests(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Get recent requests."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            """
+            SELECT * FROM requests 
+            ORDER BY timestamp DESC 
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def get_request_detail(self, request_id: str) -> Optional[dict]:
+        """Get full details for a specific request."""
+        conn = self._get_connection()
+
+        request_row = conn.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
+
+        if not request_row:
+            return None
+
+        extractions = conn.execute(
+            "SELECT * FROM extractions WHERE request_id = ? ORDER BY extraction_type, id",
+            (request_id,),
+        ).fetchall()
+
+        retrievals = conn.execute(
+            "SELECT * FROM retrievals WHERE request_id = ? ORDER BY retrieval_type, id",
+            (request_id,),
+        ).fetchall()
+
+        return {
+            "request": dict(request_row),
+            "extractions": [dict(row) for row in extractions],
+            "retrievals": [dict(row) for row in retrievals],
+        }
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get summary statistics."""
+        conn = self._get_connection()
+
+        total_requests = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+        total_extractions = conn.execute("SELECT COUNT(*) FROM extractions").fetchone()[0]
+        total_retrievals = conn.execute("SELECT COUNT(*) FROM retrievals").fetchone()[0]
+
+        avg_extraction_ms = (
+            conn.execute(
+                "SELECT AVG(extraction_ms) FROM requests WHERE extraction_ms > 0"
+            ).fetchone()[0]
+            or 0.0
+        )
+
+        # Count by type
+        entity_count = conn.execute(
+            "SELECT COUNT(*) FROM extractions WHERE extraction_type = 'entity'"
+        ).fetchone()[0]
+        relationship_count = conn.execute(
+            "SELECT COUNT(*) FROM extractions WHERE extraction_type = 'relationship'"
+        ).fetchone()[0]
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM extractions WHERE extraction_type = 'fact'"
+        ).fetchone()[0]
+        recipe_count = conn.execute(
+            "SELECT COUNT(*) FROM extractions WHERE extraction_type = 'recipe'"
+        ).fetchone()[0]
+
+        return {
+            "total_requests": total_requests,
+            "total_extractions": total_extractions,
+            "total_retrievals": total_retrievals,
+            "avg_extraction_ms": round(avg_extraction_ms, 2),
+            "extractions_by_type": {
+                "entities": entity_count,
+                "relationships": relationship_count,
+                "facts": fact_count,
+                "recipes": recipe_count,
+            },
+        }
+
+    def clear_all(self):
+        """Clear all tracking data."""
+        with self._transaction() as conn:
+            conn.execute("DELETE FROM extractions")
+            conn.execute("DELETE FROM retrievals")
+            conn.execute("DELETE FROM requests")
+        logger.info("All tracking data cleared")
+
+    def close(self):
+        """Close database connection."""
+        if hasattr(self._local, "conn") and self._local.conn:
+            self._local.conn.close()
+            self._local.conn = None
+
+
+# Global tracker instance (initialized on first use)
+_tracker: Optional[RequestTracker] = None
+
+
+def get_tracker(db_path: str = None, max_records: int = 100) -> RequestTracker:
+    """Get or create the global tracker instance."""
+    global _tracker
+    if _tracker is None:
+        _tracker = RequestTracker(
+            db_path=db_path or "./tracker_data/forma_tracker.db", max_records=max_records
+        )
+    return _tracker

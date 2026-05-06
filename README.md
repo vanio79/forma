@@ -54,6 +54,26 @@ score = confidence × similarity × time_decay
 - **Similarity**: Vector distance (1 - distance for semantic search)
 - **Time decay**: Exponential decay (30-day half-life by default), prioritizing recent information
 
+## Web UI
+
+Forma includes a Vue 3 SPA Web UI for visualizing requests, extractions, and retrievals:
+
+- **Dashboard**: Overview of system activity
+- **Requests List**: Browse recent requests with detailed information
+- **Extractions View**: See entities, relationships, facts, and recipes extracted from each request
+- **Retrievals View**: See context retrieved for augmentation with confidence and scores
+
+Access the Web UI at: `http://localhost:8000`
+
+### Request Detail Sections
+
+Each request shows:
+- Original Prompt
+- Augmented Prompt (with retrieved context)
+- Agent Response
+- Extractions (collapsible): Entities, Relationships, Facts, Recipes
+- Retrievals (collapsible): Facts and Recipes with Confidence and Score columns
+
 ## Quick Start
 
 ```bash
@@ -73,18 +93,36 @@ pip install -e ".[dev]"
 cp .env.example .env
 # Edit .env with your upstream API settings
 
-# Run the proxy
-uv run forma
-# Or directly:
-uv run python -m forma.main
+# Run the proxy using the server management script
+./server.sh start
 
-# Or with nohup for background operation:
-nohup .venv/bin/python -m forma.main > forma.log 2>&1 &
+# Or run directly
+uv run forma
+# Or:
+uv run python -m forma.main
 ```
 
 The server runs at `http://localhost:8000` by default.
 
 **Note**: On first startup, Forma will download the embedding model (`all-MiniLM-L6-v2`, ~90MB) to `./models/`. Subsequent starts load from cache - no network requests.
+
+## Server Management
+
+Use `server.sh` to manage the Forma server:
+
+```bash
+./server.sh start    # Start the server
+./server.sh stop     # Stop the server
+./server.sh status   # Check server status
+./server.sh logs     # View recent server logs
+./server.sh restart  # Restart the server
+```
+
+The script manages:
+- PID file tracking (`/.server.pid`)
+- Log file (`server.log`)
+- Health checks before reporting success
+- Graceful shutdown with force-kill fallback
 
 ## Configuration
 
@@ -104,7 +142,7 @@ The OpenAI-compatible API that Forma proxies to:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `UPSTREAM_BASE_URL` | `http://localhost:8080/v1` | Upstream API URL |
+| `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | Upstream API URL |
 | `UPSTREAM_API_KEY` | `""` | API key (leave empty for local servers) |
 | `UPSTREAM_TIMEOUT` | `300.0` | Request timeout in seconds |
 | `MODEL_MAPPING` | `""` | Map local model names to upstream (format: `local:upstream,local2:upstream2`) |
@@ -119,6 +157,7 @@ LLM used internally for extracting entities/facts/recipes:
 | `EXTRACTOR_API_KEY` | `""` | API key for extraction endpoint |
 | `EXTRACTOR_MODEL_NAME` | `""` | Model for extraction tasks |
 | `EXTRACTOR_TIMEOUT` | `120.0` | Extraction timeout (may need time for complex extraction) |
+| `EXTRACTOR_SEND_REASONING_PARAMS` | `false` | Send reasoning_effort/enable_thinking params (not supported by all APIs) |
 
 ### GrafitoDB Storage
 
@@ -132,6 +171,14 @@ LLM used internally for extracting entities/facts/recipes:
 **Note**: Embedding dimension must match the model:
 - `all-MiniLM-L6-v2`: 384 dimensions
 - `all-mpnet-base-v2`: 768 dimensions
+
+### Request Tracker (Web UI)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRACKER_ENABLED` | `true` | Enable request tracking for Web UI |
+| `TRACKER_DB_PATH` | `./tracker_data/forma_tracker.db` | Tracker SQLite database path |
+| `TRACKER_MAX_RECORDS` | `100` | Maximum request records to keep (older pruned) |
 
 ### Example: LM Studio + OpenAI
 
@@ -213,6 +260,15 @@ curl http://localhost:8000/admin/stats
 curl -X POST http://localhost:8000/admin/clear
 ```
 
+### Web UI API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /ui/stats` | Get summary statistics for dashboard |
+| `GET /ui/requests` | Get list of recent requests |
+| `GET /ui/requests/{id}` | Get detailed request information |
+| `DELETE /ui/clear` | Clear all tracking data |
+
 ## Extraction
 
 Forma uses a structured extraction prompt to extract:
@@ -224,6 +280,10 @@ Forma uses a structured extraction prompt to extract:
 - **Queries**: Natural language queries for retrieval
 
 The extraction prompt is located at `src/forma/prompts/extraction.txt` and can be customized.
+
+### Assistant Response Extraction
+
+Forma also extracts facts from assistant responses, allowing the system to learn from model-generated information. This happens automatically for non-streaming responses.
 
 ## Model Caching
 
@@ -268,6 +328,7 @@ Forma logs extraction and retrieval operations:
 |----------|-------------|
 | `logs/extractions.jsonl` | Extraction results (entities, facts, recipes extracted) |
 | `logs/retrievals.jsonl` | Retrieval results (context retrieved for augmentation) |
+| `server.log` | Server output (managed by `server.sh`) |
 
 Each entry is JSON with timestamp and full details for debugging.
 
@@ -288,6 +349,9 @@ uv run ruff format src/forma
 
 # Lint
 uv run ruff check src/forma
+
+# Build Web UI
+cd webui && npm run build
 ```
 
 ## Architecture
@@ -296,9 +360,9 @@ uv run ruff check src/forma
 
 ```
 Request → Extract → Retrieve → Augment → Forward → Response
-                                                    ↓
-                                             Background Store
-                                             (async, fire-and-forget)
+                                                     ↓
+                                              Background Store
+                                              (async, fire-and-forget)
 ```
 
 ### Storage Backend
@@ -306,6 +370,7 @@ Request → Extract → Retrieve → Augment → Forward → Response
 | Component | Type | Purpose |
 |-----------|------|---------|
 | **GrafitoDB** | SQLite + Graph + Vector | Single-file database for all storage |
+| **TrackerDB** | SQLite | Request tracking for Web UI |
 
 GrafitoDB provides:
 - **Graph storage**: Entities and relationships with Cypher query support
@@ -321,6 +386,43 @@ GrafitoDB provides:
 | **Augment** | Context + Prompt | Augmented user message |
 | **Forward** | Augmented request | Upstream API response |
 | **Store** | Extracted data | Persisted to GrafitoDB (async) |
+| **Track** | Request data | Recorded to TrackerDB |
+
+## Project Structure
+
+```
+forma/
+├── server.sh                # Server management CLI
+├── src/forma/
+│   ├── main.py              # FastAPI application entry point
+│   ├── config.py            # Configuration management
+│   ├── extractor.py         # Entity/fact/recipe extraction
+│   ├── storage.py           # GrafitoDB storage backend
+│   ├── tracker.py           # Request tracking for Web UI
+│   ├── api.py               # Web UI API endpoints
+│   ├── proxy.py             # OpenAI API proxy
+│   └── prompts/
+│       └── extraction.txt   # Extraction prompt template
+├── webui/                   # Vue 3 SPA frontend
+│   ├── src/
+│   │   ├── components/
+│   │   │   └ RequestsList.vue
+│   │   ├── views/
+│   │   ├── api.ts
+│   │   ├── types/
+│   │   └── main.ts
+│   └ package.json
+│   └ vite.config.ts
+├── webui_dist/              # Built frontend (served by FastAPI)
+├── grafito_data/            # GrafitoDB database
+├── tracker_data/            # Tracker database
+├── models/                  # Cached embedding models
+├── logs/                    # Runtime logs
+│   ├── extractions.jsonl
+│   └ retrievals.jsonl
+│   └ server.log
+└── benchmarks/              # LongMemEval benchmark
+```
 
 ## License
 

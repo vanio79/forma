@@ -1,16 +1,32 @@
-Extract from this text. Output ONLY the sections below.
+Extract from this text. Output ONLY the sections below. Follow this exact format strictly:
 
 === ENTITIES ===
-Entity Name (type) confidence: 0.X
+Entity Name (type)
+confidence: 0.X
+
+Entity Name (type)
+confidence: 0.X
 
 === RELATIONSHIPS ===
-Subject Entity -> predicate -> Object Entity confidence: 0.X
+Subject Entity -> predicate -> Object Entity
+confidence: 0.X
+
+Subject Entity -> predicate -> Object Entity
+confidence: 0.X
 
 === FACTS ===
-Standalone factual statement - transform "I/me/my" to "The user", use other entity names. confidence: 0.X
+Standalone factual statement - transform "I/me/my" to "The user", use other entity names.
+confidence: 0.X
+
+Standalone factual statement.
+confidence: 0.X
 
 === RECIPES ===
-Standalone procedural description. Internal pronouns (you, this, it) allowed within the recipe context. confidence: 0.X
+Standalone procedural description. Internal pronouns (you, this, it) allowed within the recipe context.
+confidence: 0.X
+
+Standalone procedural description.
+confidence: 0.X
 
 === ENTITIES_QUERY ===
 Entity name to search for related relationships.
@@ -42,6 +58,7 @@ Rules:
 - Fact Query: A natural language question to retrieve relevant facts from memory. Write "N/A" if no relevant query.
 - Recipe Query: A natural language question to retrieve relevant how-to guides or procedures from memory. Write "N/A" if no relevant query.
 - Queries do NOT have confidence scores.
+- FORMAT: Each item has TWO lines - the content line followed by a separate "confidence: 0.X" line. Items are separated by blank lines.
 - Confidence scale (for facts, entities, relationships, recipes only):
   - 0.9-1.0: Certain facts, directly stated as true
   - 0.7-0.8: Likely facts, reasonable inference
@@ -49,14 +66,20 @@ Rules:
   - 0.0-0.4: Very uncertain, myths, or obviously false claims
 
 Example Entities (for a task about quantization):
-GGUF format (format) confidence: 0.95
-quantization (methodology) confidence: 0.95
-Q4_K_M (format variant) confidence: 0.9
-llama.cpp (software) confidence: 0.9
-GPU memory (hardware component) confidence: 0.85
+GGUF (format)
+confidence: 0.95
+
+quantization (methodology)
+confidence: 0.95
+
+Q4_K_M (format variant)
+confidence: 0.9
 
 Example Facts (first-person transformation):
 "I prefer Q4_K_M for my models" → "The user prefers Q4_K_M for the user's models"
+confidence: 0.9
+
 "My favorite quantization method is Q4_K_M" → "The user's favorite quantization method is Q4_K_M"
+confidence: 0.85
 
 Text: {{TEXT}}

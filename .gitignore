@@ -93,3 +93,15 @@ show_retrieval.py
 
 # External dataset documentation
 dataset/
+
+# Web UI
+webui/node_modules/
+webui_dist/
+
+# Tracker database
+tracker_data/
+tracker.db
+
+# Server management
+.server.pid
+server.log

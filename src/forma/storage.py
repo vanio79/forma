@@ -109,23 +109,33 @@ class Storage:
             return model_name
 
     def _create_vector_indexes(self, dim: int) -> None:
-        """Create vector indexes for facts and recipes semantic search."""
+        """Create vector indexes for facts and recipes semantic search.
+
+        Note: store_embeddings=True is required to persist embeddings to the database,
+        so they can be loaded on server restart.
+        """
         try:
             self.db.create_vector_index(
                 name=FACTS_VECTOR_INDEX,
                 dim=dim,
                 embedding_function=self.embedding_function,
+                options={"store_embeddings": True},
                 if_not_exists=True,
             )
-            logger.info(f"Created vector index: {FACTS_VECTOR_INDEX} (dim={dim})")
+            logger.info(
+                f"Created vector index: {FACTS_VECTOR_INDEX} (dim={dim}, store_embeddings=True)"
+            )
 
             self.db.create_vector_index(
                 name=RECIPES_VECTOR_INDEX,
                 dim=dim,
                 embedding_function=self.embedding_function,
+                options={"store_embeddings": True},
                 if_not_exists=True,
             )
-            logger.info(f"Created vector index: {RECIPES_VECTOR_INDEX} (dim={dim})")
+            logger.info(
+                f"Created vector index: {RECIPES_VECTOR_INDEX} (dim={dim}, store_embeddings=True)"
+            )
         except Exception as e:
             logger.warning(f"Could not create vector indexes: {e}")
 
@@ -677,21 +687,29 @@ class Storage:
 
                 # Get incoming relationships - find nodes that point to this entity
                 # Use Cypher query for efficiency
+                # Note: GrafitoDB Cypher doesn't support NOT IN, so we filter in Python
                 cypher = (
                     "MATCH (e:Entity {name: '" + subject + "'}) "
                     "MATCH (source:Entity)-[r]->(e) "
-                    "WHERE r.type NOT IN ['type', 'confidence', 'extracted_at'] "
-                    "RETURN source.name AS source_name, r.type AS rel_type, "
-                    "r.confidence AS confidence, r.extracted_at AS extracted_at "
+                    "RETURN source.name AS source_name, r, r.confidence AS confidence, "
+                    "r.extracted_at AS extracted_at "
                     "LIMIT " + str(n_results)
                 )
                 try:
                     incoming_results = self.db.execute(cypher)
                     for result in incoming_results:
+                        # Extract type from relationship object
+                        rel_obj = result.get("r", {})
+                        rel_type = rel_obj.get("type", "") if isinstance(rel_obj, dict) else ""
+
+                        # Skip metadata predicates (filter in Python)
+                        if rel_type in ["type", "confidence", "extracted_at"]:
+                            continue
+
                         relationships.append(
                             {
                                 "subject": result.get("source_name", ""),
-                                "predicate": result.get("rel_type", ""),
+                                "predicate": rel_type,
                                 "object": subject,
                                 "confidence": float(result.get("confidence", 0.9)),
                                 "extracted_at": result.get("extracted_at", ""),
@@ -701,21 +719,28 @@ class Storage:
                     logger.debug(f"Cypher query error for incoming relationships: {e}")
             else:
                 # Get all relationships using Cypher
+                # Note: GrafitoDB Cypher doesn't support NOT IN, so we filter in Python
                 cypher = (
                     "MATCH (source:Entity)-[r]->(target:Entity) "
-                    "WHERE r.type NOT IN ['type', 'confidence', 'extracted_at'] "
-                    "RETURN source.name AS subject, r.type AS predicate, "
-                    "target.name AS object, r.confidence AS confidence, "
-                    "r.extracted_at AS extracted_at "
+                    "RETURN source.name AS subject, r, target.name AS object, "
+                    "r.confidence AS confidence, r.extracted_at AS extracted_at "
                     "LIMIT " + str(n_results)
                 )
                 try:
                     all_results = self.db.execute(cypher)
                     for result in all_results:
+                        # Extract type from relationship object
+                        rel_obj = result.get("r", {})
+                        rel_type = rel_obj.get("type", "") if isinstance(rel_obj, dict) else ""
+
+                        # Skip metadata predicates (filter in Python)
+                        if rel_type in ["type", "confidence", "extracted_at"]:
+                            continue
+
                         relationships.append(
                             {
                                 "subject": result.get("subject", ""),
-                                "predicate": result.get("predicate", ""),
+                                "predicate": rel_type,
                                 "object": result.get("object", ""),
                                 "confidence": float(result.get("confidence", 0.9)),
                                 "extracted_at": result.get("extracted_at", ""),
@@ -947,12 +972,18 @@ class Storage:
 
             tokens_used += item["tokens"]
             if item["type"] == "relationship":
+                # Add score to data item
+                item["data"]["score"] = item["score"]
                 relationships.append(item["data"])
                 scores["relationships"].append(item["score"])
             elif item["type"] == "fact":
+                # Add score to data item
+                item["data"]["score"] = item["score"]
                 facts.append(item["data"])
                 scores["facts"].append(item["score"])
             elif item["type"] == "recipe":
+                # Add score to data item
+                item["data"]["score"] = item["score"]
                 recipes.append(item["data"])
                 scores["recipes"].append(item["score"])
 
@@ -992,8 +1023,7 @@ class Storage:
             lines.append("Known procedures:")
             for recipe in context["recipes"]:
                 desc = recipe["description"]
-                if len(desc) > 200:
-                    desc = desc[:200] + "..."
+                # Don't truncate recipes - they need full procedural content
                 lines.append(f"- {desc}")
 
         if lines:

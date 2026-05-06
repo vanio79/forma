@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     grafitodb_vector_dim: int = 384  # Embedding dimension (depends on model)
     grafitodb_model_cache_path: str = "./models"  # Local cache for embedding model
 
+    # Request tracker configuration (for web UI)
+    tracker_db_path: str = "./tracker_data/forma_tracker.db"  # SQLite tracker database
+    tracker_max_records: int = 100  # Maximum request records to keep
+    tracker_enabled: bool = True  # Enable request tracking for web UI
+
     # Model mapping (optional: map local model names to upstream models)
     # Format: "local_name:upstream_name,local_name2:upstream_name2"
     model_mapping: str = ""

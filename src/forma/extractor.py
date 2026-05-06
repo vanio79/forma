@@ -44,9 +44,44 @@ class ExtractionResult:
             logger.warning(self.parse_error)
 
     def _parse_text_format(self, response: str) -> None:
-        """Parse the structured text format."""
+        """Parse the structured text format with confidence on separate lines."""
         try:
-            # Parse entities - look for lines with (type) pattern
+            # Helper function to parse two-line blocks (content + confidence)
+            def parse_blocks(section_text: str) -> list[tuple[str, float]]:
+                """Parse blocks where each item has content line + confidence line."""
+                blocks = re.split(r"\n\n+", section_text.strip())
+                results = []
+                for block in blocks:
+                    block = block.strip()
+                    # Skip empty blocks and N/A variants (including truncated)
+                    if not block or block.upper() in ("N/A", "NA", "N"):
+                        continue
+
+                    lines = block.split("\n")
+                    if len(lines) < 1:
+                        continue
+
+                    # First line is content, look for confidence on any line
+                    content = lines[0].strip()
+                    confidence = 0.9
+
+                    # Find confidence line
+                    for line in lines:
+                        conf_match = re.match(r"confidence:\s*([\d.]+)", line.strip())
+                        if conf_match:
+                            confidence = float(conf_match.group(1))
+                            break
+
+                    # Remove confidence line from content if it's on line 2
+                    if len(lines) >= 2 and lines[1].strip().startswith("confidence:"):
+                        content = lines[0].strip()
+
+                    if content and not content.startswith("confidence:"):
+                        results.append((content, confidence))
+
+                return results
+
+            # Parse entities - Format: Name (type) on line 1, confidence on line 2
             entities_section = re.search(
                 r"=== ENTITIES ===\n(.*?)"
                 r"(?==== RELATIONSHIPS ===|=== FACTS ===|=== RECIPES ===|"
@@ -55,27 +90,20 @@ class ExtractionResult:
                 re.DOTALL,
             )
             if entities_section:
-                for line in entities_section.group(1).strip().split("\n"):
-                    line = line.strip()
-                    if not line:
-                        continue
+                blocks = parse_blocks(entities_section.group(1))
+                for content, confidence in blocks:
                     # Format: [Name] (type) or Name (type) - brackets optional
-                    match = re.match(
-                        r"\[?([^\[\]\(\)]+)\]?\s*\(([^)]+)\)\s*(?:confidence:\s*([\d.]+))?", line
-                    )
+                    match = re.match(r"\[?([^\[\]\(\)]+)\]?\s*\(([^)]+)\)", content)
                     if match:
-                        confidence = float(match.group(3)) if match.group(3) else 0.9
                         self.entities.append(
                             {
                                 "name": match.group(1).strip(),
-                                "type": match.group(2)
-                                .strip()
-                                .lower(),  # Normalize type to lowercase
+                                "type": match.group(2).strip().lower(),
                                 "confidence": max(0.0, min(1.0, confidence)),
                             }
                         )
 
-            # Parse relationships - look for lines with -> pattern
+            # Parse relationships - Format: Subject -> predicate -> Object on line 1
             rels_section = re.search(
                 r"=== RELATIONSHIPS ===\n(.*?)"
                 r"(?==== FACTS ===|=== RECIPES ===|=== ENTITIES_QUERY ===|"
@@ -84,100 +112,53 @@ class ExtractionResult:
                 re.DOTALL,
             )
             if rels_section:
-                for line in rels_section.group(1).strip().split("\n"):
-                    line = line.strip()
-                    if not line:
-                        continue
+                blocks = parse_blocks(rels_section.group(1))
+                for content, confidence in blocks:
                     # Must have -> to be a relationship
-                    if "->" not in line:
+                    if "->" not in content:
                         continue
-                    # Format: Subject -> predicate -> Object confidence: 0.9
-                    # Need to capture object before confidence suffix
+                    # Format: Subject -> predicate -> Object
                     match = re.match(
                         r"[\[\(]?([^\[\]\(\)]+)[\]\)]?\s*->\s*(.+?)\s*->\s*"
-                        r"[\[\(]?([^\[\]\(\)]+)[\]\)]?\s*(?:confidence:\s*([\d.]+))?",
-                        line,
+                        r"[\[\(]?([^\[\]\(\)]+)[\]\)]?",
+                        content,
                     )
                     if match:
-                        confidence = float(match.group(4)) if match.group(4) else 0.9
-                        # Clean predicate and object
-                        # remove trailing confidence if accidentally captured
-                        predicate = match.group(2).strip()
-                        object = match.group(3).strip()
-                        # Remove any "confidence: X.X" that might be in predicate/object
-                        predicate = re.sub(r"\s*confidence:\s*[\d.]+\s*$", "", predicate)
-                        object = re.sub(r"\s*confidence:\s*[\d.]+\s*$", "", object)
                         self.relationships.append(
                             {
                                 "subject": match.group(1).strip(),
-                                "predicate": predicate,
-                                "object": object,
+                                "predicate": match.group(2).strip(),
+                                "object": match.group(3).strip(),
                                 "confidence": max(0.0, min(1.0, confidence)),
                             }
                         )
 
-            # Parse facts - clean sentences, may be on multiple lines or combined
+            # Parse facts - Format: Statement on line 1, confidence on line 2
             facts_section = re.search(
                 r"=== FACTS ===\n(.*?)(?==== RECIPES ===|=== ENTITIES_QUERY ===|=== END ===|$)",
                 response,
                 re.DOTALL,
             )
             if facts_section:
-                facts_text = facts_section.group(1).strip()
-                # Split by periods if all facts are combined in one line
-                if "." in facts_text and "\n" not in facts_text.strip():
-                    # Facts are combined - split by sentences
-                    sentences = re.split(r"\.\s+", facts_text)
-                    for sentence in sentences:
-                        sentence = sentence.strip()
-                        if not sentence:
-                            continue
-                        # Remove confidence suffix if present
-                        match = re.match(r"(.+?)\s*(?:confidence:\s*([\d.]+))?$", sentence)
-                        if match:
-                            statement = match.group(1).strip()
-                            confidence = float(match.group(2)) if match.group(2) else 0.9
-                            # Skip N/A values
-                            if statement.upper() == "N/A":
-                                continue
-                            self.facts.append(
-                                {
-                                    "statement": statement,
-                                    "confidence": max(0.0, min(1.0, confidence)),
-                                }
-                            )
-                else:
-                    # Facts are on separate lines
-                    for line in facts_text.split("\n"):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        # Skip lines that look like entities (have (type) pattern)
-                        if "(" in line and re.search(r"\([^)]+\)", line):
-                            continue
-                        # Skip lines that look like relationships (have ->)
-                        if "->" in line:
-                            continue
-                        # Format: Statement confidence: 0.9 (confidence optional)
-                        match = re.match(r"(.+?)\s*(?:confidence:\s*([\d.]+))?$", line)
-                        if match:
-                            statement = match.group(1).strip()
-                            confidence = float(match.group(2)) if match.group(2) else 0.9
-                            # Skip if statement is just "confidence: X.X" or empty or N/A
-                            if (
-                                statement.lower().startswith("confidence:")
-                                or not statement
-                                or statement.upper() == "N/A"
-                            ):
-                                continue
-                            self.facts.append(
-                                {
-                                    "statement": statement,
-                                    "confidence": max(0.0, min(1.0, confidence)),
-                                }
-                            )
+                blocks = parse_blocks(facts_section.group(1))
+                for content, confidence in blocks:
+                    # Skip if content is empty or N/A
+                    if content.upper() == "N/A":
+                        continue
+                    # Skip lines that look like entities or relationships
+                    if "(" in content and re.search(r"\([^)]+\)", content):
+                        continue
+                    if "->" in content:
+                        continue
+                    self.facts.append(
+                        {
+                            "statement": content,
+                            "confidence": max(0.0, min(1.0, confidence)),
+                        }
+                    )
 
-            # Parse recipes - procedural knowledge as plain text
+            # Parse recipes - Format: Multi-line description, confidence at end
+            # Recipes can span multiple lines, unlike entities/relationships/facts
             recipes_section = re.search(
                 r"=== RECIPES ===\n(.*?)"
                 r"(?==== ENTITIES_QUERY ===|=== FACT_QUERY ===|"
@@ -186,33 +167,47 @@ class ExtractionResult:
                 re.DOTALL,
             )
             if recipes_section:
-                recipes_text = recipes_section.group(1).strip()
-                # Split by blank lines to get individual recipes
-                recipe_blocks = re.split(r"\n\n+", recipes_text)
-                for block in recipe_blocks:
-                    block = block.strip()
-                    if not block:
+                # Parse recipes with multi-line content support
+                def parse_recipe_blocks(section_text: str) -> list[tuple[str, float]]:
+                    """Parse recipe blocks where content can span multiple lines."""
+                    blocks = re.split(r"\n\n+", section_text.strip())
+                    results = []
+                    for block in blocks:
+                        block = block.strip()
+                        if not block or block.upper() in ("N/A", "NA", "N"):
+                            continue
+
+                        lines = block.split("\n")
+                        if len(lines) < 1:
+                            continue
+
+                        # Find confidence line (usually last line)
+                        confidence = 0.9
+                        content_lines = []
+                        for line in lines:
+                            conf_match = re.match(r"confidence:\s*([\d.]+)", line.strip())
+                            if conf_match:
+                                confidence = float(conf_match.group(1))
+                            else:
+                                content_lines.append(line.strip())
+
+                        # Join all content lines for multi-line recipe descriptions
+                        content = "\n".join(content_lines)
+                        if content and not content.startswith("confidence:"):
+                            results.append((content, confidence))
+
+                    return results
+
+                blocks = parse_recipe_blocks(recipes_section.group(1))
+                for content, confidence in blocks:
+                    if content.upper() == "N/A":
                         continue
-
-                    # Extract confidence if present
-                    conf_match = re.search(r"confidence:\s*([\d.]+)", block)
-                    confidence = float(conf_match.group(1)) if conf_match else 0.9
-
-                    # Remove confidence suffix from the description
-                    description = re.sub(r"\s*confidence:\s*[\d.]+\s*$", "", block)
-                    description = description.strip()
-
-                    # Skip N/A values
-                    if description.upper() == "N/A":
-                        continue
-
-                    if description:
-                        self.recipes.append(
-                            {
-                                "description": description,
-                                "confidence": max(0.0, min(1.0, confidence)),
-                            }
-                        )
+                    self.recipes.append(
+                        {
+                            "description": content,
+                            "confidence": max(0.0, min(1.0, confidence)),
+                        }
+                    )
 
             # Parse entities query - list of entity names to query
             entities_query_section = re.search(
@@ -225,7 +220,8 @@ class ExtractionResult:
                 entities_query_text = entities_query_section.group(1).strip()
                 for line in entities_query_text.split("\n"):
                     line = line.strip()
-                    if not line or line == "N/A":
+                    # Skip confidence lines and empty/N/A
+                    if not line or line == "N/A" or line.startswith("confidence:"):
                         continue
                     self.entities_queries.append(line)
 
@@ -237,7 +233,14 @@ class ExtractionResult:
             )
             if fact_query_section:
                 fact_query_text = fact_query_section.group(1).strip()
-                if fact_query_text and fact_query_text != "N/A":
+                # Remove any confidence line if present
+                lines = fact_query_text.split("\n")
+                fact_query_text = lines[0].strip() if lines else ""
+                if (
+                    fact_query_text
+                    and fact_query_text != "N/A"
+                    and not fact_query_text.startswith("confidence:")
+                ):
                     self.fact_query = fact_query_text
 
             # Parse recipe query - single natural language query
@@ -248,7 +251,14 @@ class ExtractionResult:
             )
             if recipe_query_section:
                 recipe_query_text = recipe_query_section.group(1).strip()
-                if recipe_query_text and recipe_query_text != "N/A":
+                # Remove any confidence line if present
+                lines = recipe_query_text.split("\n")
+                recipe_query_text = lines[0].strip() if lines else ""
+                if (
+                    recipe_query_text
+                    and recipe_query_text != "N/A"
+                    and not recipe_query_text.startswith("confidence:")
+                ):
                     self.recipe_query = recipe_query_text
 
         except Exception as e:
@@ -344,7 +354,7 @@ class Extractor:
         proxy = self.proxy or OpenAIProxy(self.settings)
         response = await proxy.extract(
             messages=messages,
-            max_tokens=512,  # Lower since no reasoning output
+            max_tokens=1024,  # Increased for complex extractions
             temperature=0.1,
         )
 
