@@ -1,4 +1,4 @@
-"""OpenAI-compatible proxy implementation."""
+"""OpenAI-compatible proxy implementation with multi-upstream support."""
 
 import json
 import logging
@@ -9,36 +9,35 @@ from fastapi import HTTPException, status
 from fastapi.responses import StreamingResponse
 
 from forma.config import Settings
+from forma.upstream_manager import UpstreamConfig
 
 logger = logging.getLogger(__name__)
 
 
 class OpenAIProxy:
-    """Proxy client for OpenAI-compatible APIs."""
+    """Proxy client for OpenAI-compatible APIs with multi-upstream support."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, upstream_manager) -> None:
+        """Initialize the proxy.
+
+        Args:
+            settings: Application settings
+            upstream_manager: UpstreamManager for model-based routing
+        """
         self.settings = settings
-        self.base_url = settings.upstream_base_url.rstrip("/")
-        self.headers = {
-            "Content-Type": "application/json",
-        }
-        if settings.upstream_api_key:
-            self.headers["Authorization"] = f"Bearer {settings.upstream_api_key}"
+        self._upstream_manager = upstream_manager
 
-        # Extraction LLM endpoint configuration
-        self.extractor_url = (
+        # Extraction LLM endpoint configuration (separate from main upstreams)
+        self._extractor_url = (
             settings.extractor_base_url.rstrip("/")
             if settings.extractor_base_url
-            else self.base_url
+            else None  # Will fail if no extractor URL configured and no upstream for extractor model
         )
-        self.extractor_headers = {"Content-Type": "application/json"}
+        self._extractor_headers = {"Content-Type": "application/json"}
         if settings.extractor_api_key:
-            self.extractor_headers["Authorization"] = f"Bearer {settings.extractor_api_key}"
-        elif settings.upstream_api_key and not settings.extractor_base_url:
-            # Fall back to upstream API key if extraction endpoint not separately configured
-            self.extractor_headers["Authorization"] = f"Bearer {settings.upstream_api_key}"
+            self._extractor_headers["Authorization"] = f"Bearer {settings.extractor_api_key}"
 
-        # Reusable HTTP client (connection pooled, limited)
+        # Reusable HTTP client (connection pooled)
         self._client = httpx.AsyncClient(
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
         )
@@ -47,49 +46,93 @@ class OpenAIProxy:
         """Close the underlying HTTP client."""
         await self._client.aclose()
 
-    def _map_model(self, model: str) -> str:
-        """Map local model name to upstream model name."""
-        mapping = self.settings.get_model_mapping()
-        return mapping.get(model, model)
+    def reload_upstreams(self) -> None:
+        """Reload upstream configurations from database."""
+        self._upstream_manager.reload()
+        logger.info("Upstreams reloaded")
+
+    def _get_upstream(self, model: str) -> UpstreamConfig | None:
+        """Get the upstream configuration for a model.
+
+        Returns None if no upstream is configured for this model.
+        """
+        return self._upstream_manager.get_upstream_for_model(model)
+
+    def _validate_upstream(self, upstream: UpstreamConfig | None, model: str) -> UpstreamConfig:
+        """Validate that an upstream exists for the model, raising error if not."""
+        if upstream is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No upstream configured for model '{model}'. Please add an upstream with this model name.",
+            )
+        return upstream
 
     async def _forward_request(
         self,
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        upstream: UpstreamConfig | None = None,
     ) -> dict[str, Any]:
-        """Forward a non-streaming request to upstream API."""
-        url = f"{self.base_url}{path}"
-        if payload and "model" in payload:
-            payload["model"] = self._map_model(payload["model"])
+        """Forward a non-streaming request to upstream API.
+
+        Args:
+            method: HTTP method
+            path: API path
+            payload: Request payload
+            upstream: Specific upstream to use (if None, determined by model in payload)
+
+        Raises:
+            HTTPException: If no upstream is configured for the model
+        """
+        # Determine upstream based on model
+        model = payload.get("model", "") if payload else ""
+        if upstream is None:
+            upstream = self._get_upstream(model)
+            self._validate_upstream(upstream, model)
+
+        # Replace model in payload with upstream_model
+        if payload and "model" in payload and upstream.upstream_model:
+            payload["model"] = upstream.upstream_model
+
+        url = f"{upstream.base_url}{path}"
+        headers = {"Content-Type": "application/json"}
+        if upstream.api_key:
+            headers["Authorization"] = f"Bearer {upstream.api_key}"
+
+        logger.debug(
+            f"Forwarding request to {upstream.name}: {url} (model: {upstream.upstream_model})"
+        )
 
         try:
             response = await self._client.request(
                 method=method,
                 url=url,
-                headers=self.headers,
+                headers=headers,
                 json=payload,
-                timeout=self.settings.upstream_timeout,
+                timeout=upstream.timeout,
             )
             response.raise_for_status()
             return cast(dict[str, Any], response.json())
         except httpx.TimeoutException as e:
-            logger.error(f"Upstream timeout: {e}")
+            logger.error(f"Upstream timeout ({upstream.name}): {e}")
             raise HTTPException(
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail="Upstream API timeout",
+                detail=f"Upstream API timeout ({upstream.name})",
             ) from e
         except httpx.HTTPStatusError as e:
-            logger.error(f"Upstream error: {e.response.status_code} - {e.response.text}")
+            logger.error(
+                f"Upstream error ({upstream.name}): {e.response.status_code} - {e.response.text}"
+            )
             raise HTTPException(
                 status_code=e.response.status_code,
                 detail=e.response.text,
             ) from e
         except httpx.RequestError as e:
-            logger.error(f"Upstream connection error: {e}")
+            logger.error(f"Upstream connection error ({upstream.name}): {e}")
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Upstream connection error: {e}",
+                detail=f"Upstream connection error ({upstream.name}): {e}",
             ) from e
 
     async def stream_request(
@@ -97,37 +140,63 @@ class OpenAIProxy:
         method: str,
         path: str,
         payload: dict[str, Any],
+        upstream: UpstreamConfig | None = None,
     ) -> StreamingResponse:
-        """Forward a streaming request to upstream API."""
-        url = f"{self.base_url}{path}"
-        if "model" in payload:
-            payload["model"] = self._map_model(payload["model"])
+        """Forward a streaming request to upstream API.
+
+        Args:
+            method: HTTP method
+            path: API path
+            payload: Request payload
+            upstream: Specific upstream to use (if None, determined by model in payload)
+
+        Raises:
+            HTTPException: If no upstream is configured for the model
+        """
+        # Determine upstream based on model
+        model = payload.get("model", "")
+        if upstream is None:
+            upstream = self._get_upstream(model)
+            self._validate_upstream(upstream, model)
+
+        # Replace model in payload with upstream_model
+        if "model" in payload and upstream.upstream_model:
+            payload["model"] = upstream.upstream_model
+
+        url = f"{upstream.base_url}{path}"
+        headers = {"Content-Type": "application/json"}
+        if upstream.api_key:
+            headers["Authorization"] = f"Bearer {upstream.api_key}"
+
+        logger.debug(
+            f"Streaming request to {upstream.name}: {url} (model: {upstream.upstream_model})"
+        )
 
         async def stream_generator() -> Any:
             try:
                 async with self._client.stream(
                     method=method,
                     url=url,
-                    headers=self.headers,
+                    headers=headers,
                     json=payload,
-                    timeout=self.settings.upstream_timeout,
+                    timeout=upstream.timeout,
                 ) as response:
                     response.raise_for_status()
                     async for chunk in response.aiter_bytes():
                         yield chunk
             except httpx.TimeoutException as e:
-                logger.error(f"Upstream stream timeout: {e}")
+                logger.error(f"Upstream stream timeout ({upstream.name}): {e}")
                 error_data = json.dumps(
                     {
                         "error": {
-                            "message": "Upstream API timeout",
+                            "message": f"Upstream API timeout ({upstream.name})",
                             "type": "timeout_error",
                         }
                     }
                 )
                 yield f"data: {error_data}\n\n".encode()
             except httpx.HTTPStatusError as e:
-                logger.error(f"Upstream stream error: {e.response.status_code}")
+                logger.error(f"Upstream stream error ({upstream.name}): {e.response.status_code}")
                 error_data = json.dumps(
                     {
                         "error": {
@@ -138,11 +207,11 @@ class OpenAIProxy:
                 )
                 yield f"data: {error_data}\n\n".encode()
             except httpx.RequestError as e:
-                logger.error(f"Upstream stream connection error: {e}")
+                logger.error(f"Upstream stream connection error ({upstream.name}): {e}")
                 error_data = json.dumps(
                     {
                         "error": {
-                            "message": f"Upstream connection error: {e}",
+                            "message": f"Upstream connection error ({upstream.name}): {e}",
                             "type": "connection_error",
                         }
                     }
@@ -154,9 +223,21 @@ class OpenAIProxy:
             media_type="text/event-stream",
         )
 
-    async def list_models(self) -> dict[str, Any]:
-        """List available models from upstream."""
-        return await self._forward_request("GET", "/models")
+    async def list_models(self, model: str = None) -> dict[str, Any]:
+        """List available models from an upstream.
+
+        Args:
+            model: Optional model name to determine which upstream to use.
+                   If not provided, returns empty list if no upstreams configured.
+        """
+        if model:
+            upstream = self._get_upstream(model)
+            if upstream:
+                return await self._forward_request("GET", "/models", upstream=upstream)
+
+        # No model specified - return empty models list
+        # (Could also iterate all upstreams and merge, but that's complex)
+        return {"object": "list", "data": []}
 
     async def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any] | StreamingResponse:
         """Forward chat completion request."""
@@ -195,9 +276,31 @@ class OpenAIProxy:
 
         Returns:
             Extraction result as string
+
+        Raises:
+            HTTPException: If extraction endpoint is not configured
         """
-        url = f"{self.extractor_url}/chat/completions"
         model_name = model or self.settings.extractor_model_name
+
+        # Use dedicated extractor URL if configured
+        if self._extractor_url:
+            url = f"{self._extractor_url}/chat/completions"
+            headers = self._extractor_headers
+            timeout = self.settings.extractor_timeout
+        else:
+            # Try to find upstream for the extractor model name
+            upstream = self._get_upstream(model_name)
+            if upstream is None:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Extraction endpoint not configured and no upstream for model '{model_name}'. "
+                    f"Please set EXTRACTOR_BASE_URL or add an upstream named '{model_name}'.",
+                )
+            url = f"{upstream.base_url}/chat/completions"
+            headers = {"Content-Type": "application/json"}
+            if upstream.api_key:
+                headers["Authorization"] = f"Bearer {upstream.api_key}"
+            timeout = self.settings.extractor_timeout
 
         payload = {
             "model": model_name,
@@ -215,9 +318,9 @@ class OpenAIProxy:
             response = await self._client.request(
                 method="POST",
                 url=url,
-                headers=self.extractor_headers,
+                headers=headers,
                 json=payload,
-                timeout=self.settings.extractor_timeout,
+                timeout=timeout,
             )
             response.raise_for_status()
             data = cast(dict[str, Any], response.json())

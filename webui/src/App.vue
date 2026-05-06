@@ -8,6 +8,7 @@
         <nav class="nav">
           <router-link to="/" class="nav-link">Dashboard</router-link>
           <router-link to="/requests" class="nav-link">Requests</router-link>
+          <router-link to="/upstreams" class="nav-link">Upstreams</router-link>
         </nav>
       </div>
     </header>

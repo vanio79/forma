@@ -23,6 +23,10 @@
             <div class="metric-value">{{ stats?.total_retrievals ?? 0 }}</div>
             <div class="metric-label">Retrievals</div>
           </div>
+          <div class="card">
+            <div class="metric-value">{{ stats?.upstream_count ?? 0 }}</div>
+            <div class="metric-label">Upstreams</div>
+          </div>
         </div>
       </div>
 
@@ -64,7 +68,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
 import type { Stats } from "../types";
-import { getStats, clearTrackingData } from "../api";
+import { getStats, clearData } from "../api";
 
 const stats = ref<Stats | null>(null);
 const loading = ref(true);
@@ -89,12 +93,12 @@ const loadStats = async () => {
 };
 
 const handleClear = async () => {
-  if (!confirm("Are you sure you want to clear all tracking data? This cannot be undone.")) {
+  if (!confirm("Are you sure you want to clear all request history? This cannot be undone.")) {
     return;
   }
   clearing.value = true;
   try {
-    await clearTrackingData();
+    await clearData();
     await loadStats();
   } catch (e) {
     error.value = `Failed to clear data: ${e}`;

@@ -1,6 +1,6 @@
-"""Request tracking database for Forma web UI.
+"""Forma database for system data and request history.
 
-Tracks requests, extractions, and retrievals for the Web UI.
+Stores requests, extractions, retrievals, and upstream configurations.
 Uses SQLite for lightweight, file-based storage.
 """
 
@@ -17,14 +17,27 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
-class RequestTracker:
-    """SQLite-based tracker for Forma operations."""
+class FormaDatabase:
+    """SQLite-based database for Forma operations and configuration."""
 
     # SQL schema - simplified design
     SCHEMA = """
+    CREATE TABLE IF NOT EXISTS upstreams (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        upstream_model TEXT DEFAULT '',
+        base_url TEXT NOT NULL,
+        api_key TEXT DEFAULT '',
+        timeout REAL DEFAULT 300.0,
+        is_enabled INTEGER DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    
     CREATE TABLE IF NOT EXISTS requests (
         id TEXT PRIMARY KEY,
         model TEXT,
+        upstream_id TEXT DEFAULT '',
         user_prompt TEXT,
         history TEXT,
         extraction_response TEXT,
@@ -51,13 +64,15 @@ class RequestTracker:
         score REAL DEFAULT 0.0
     );
     
+    CREATE INDEX IF NOT EXISTS idx_upstreams_name ON upstreams(name);
     CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_requests_upstream_id ON requests(upstream_id);
     CREATE INDEX IF NOT EXISTS idx_extractions_request_id ON extractions(request_id);
     CREATE INDEX IF NOT EXISTS idx_retrievals_request_id ON retrievals(request_id);
     """
 
-    def __init__(self, db_path: str = "./tracker_data/forma_tracker.db", max_records: int = 100):
-        """Initialize the tracker.
+    def __init__(self, db_path: str = "./data/forma.db", max_records: int = 100):
+        """Initialize the database.
 
         Args:
             db_path: Path to SQLite database file
@@ -96,7 +111,7 @@ class RequestTracker:
         """Initialize database schema."""
         with self._transaction() as conn:
             conn.executescript(self.SCHEMA)
-        logger.info(f"Tracker database initialized at {self.db_path}")
+        logger.info(f"Forma database initialized at {self.db_path}")
 
     def _prune_old_records(self):
         """Remove records exceeding max_records limit."""
@@ -394,6 +409,9 @@ class RequestTracker:
             "SELECT COUNT(*) FROM extractions WHERE extraction_type = 'recipe'"
         ).fetchone()[0]
 
+        # Count upstreams
+        upstream_count = conn.execute("SELECT COUNT(*) FROM upstreams").fetchone()[0]
+
         return {
             "total_requests": total_requests,
             "total_extractions": total_extractions,
@@ -405,7 +423,140 @@ class RequestTracker:
                 "facts": fact_count,
                 "recipes": recipe_count,
             },
+            "upstream_count": upstream_count,
         }
+
+    # === Upstream Management ===
+
+    def _convert_upstream_row(self, row: sqlite3.Row) -> dict:
+        """Convert a database row to a dict with proper boolean conversion."""
+        data = dict(row)
+        # Convert integer is_enabled to boolean
+        data["is_enabled"] = bool(data.get("is_enabled", 1))
+        return data
+
+    def get_upstreams(self) -> list[dict]:
+        """Get all upstream configurations."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM upstreams ORDER BY name ASC").fetchall()
+        return [self._convert_upstream_row(row) for row in rows]
+
+    def get_upstream_by_id(self, upstream_id: str) -> Optional[dict]:
+        """Get a specific upstream by ID."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT * FROM upstreams WHERE id = ?", (upstream_id,)).fetchone()
+        return self._convert_upstream_row(row) if row else None
+
+    def get_upstream_by_name(self, name: str) -> Optional[dict]:
+        """Get a specific upstream by name (model name)."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT * FROM upstreams WHERE name = ?", (name,)).fetchone()
+        return self._convert_upstream_row(row) if row else None
+
+    def get_enabled_upstream_by_name(self, name: str) -> Optional[dict]:
+        """Get an enabled upstream by name (model name)."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM upstreams WHERE name = ? AND is_enabled = 1", (name,)
+        ).fetchone()
+        return self._convert_upstream_row(row) if row else None
+
+    def create_upstream(
+        self,
+        id: str,
+        name: str,
+        base_url: str,
+        upstream_model: str = "",
+        api_key: str = "",
+        timeout: float = 300.0,
+        is_enabled: bool = True,
+    ) -> str:
+        """Create a new upstream configuration.
+
+        Args:
+            id: Unique ID
+            name: Local model name (routing key - client requests with this model go to this upstream)
+            upstream_model: Model name to send to upstream API (if empty, uses name)
+            base_url: Upstream API base URL
+            api_key: API key for authentication
+            timeout: Request timeout in seconds
+            is_enabled: Whether this upstream is enabled
+        """
+        timestamp = int(datetime.utcnow().timestamp())
+        # If upstream_model is empty, use name as the model to send upstream
+        model_to_send = upstream_model or name
+
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO upstreams (id, name, upstream_model, base_url, api_key, timeout, 
+                                       is_enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    id,
+                    name,
+                    model_to_send,
+                    base_url,
+                    api_key,
+                    timeout,
+                    int(is_enabled),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+        logger.info(f"Created upstream: {name} -> {model_to_send} ({base_url})")
+        return id
+
+    def update_upstream(
+        self,
+        id: str,
+        name: str,
+        base_url: str,
+        upstream_model: str = "",
+        api_key: str = "",
+        timeout: float = 300.0,
+        is_enabled: bool = True,
+    ) -> bool:
+        """Update an existing upstream configuration."""
+        timestamp = int(datetime.utcnow().timestamp())
+        # If upstream_model is empty, use name as the model to send upstream
+        model_to_send = upstream_model or name
+
+        with self._transaction() as conn:
+            result = conn.execute(
+                """
+                UPDATE upstreams 
+                SET name = ?, upstream_model = ?, base_url = ?, api_key = ?, timeout = ?,
+                    is_enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    name,
+                    model_to_send,
+                    base_url,
+                    api_key,
+                    timeout,
+                    int(is_enabled),
+                    timestamp,
+                    id,
+                ),
+            )
+
+            if result.rowcount > 0:
+                logger.info(f"Updated upstream: {name} -> {model_to_send}")
+                return True
+        return False
+
+    def delete_upstream(self, upstream_id: str) -> bool:
+        """Delete an upstream configuration."""
+        with self._transaction() as conn:
+            result = conn.execute("DELETE FROM upstreams WHERE id = ?", (upstream_id,))
+            if result.rowcount > 0:
+                logger.info(f"Deleted upstream: {upstream_id}")
+                return True
+        return False
 
     def clear_all(self):
         """Clear all tracking data."""
@@ -413,7 +564,7 @@ class RequestTracker:
             conn.execute("DELETE FROM extractions")
             conn.execute("DELETE FROM retrievals")
             conn.execute("DELETE FROM requests")
-        logger.info("All tracking data cleared")
+        logger.info("All Forma data cleared")
 
     def close(self):
         """Close database connection."""
@@ -422,15 +573,13 @@ class RequestTracker:
             self._local.conn = None
 
 
-# Global tracker instance (initialized on first use)
-_tracker: Optional[RequestTracker] = None
+# Global database instance (initialized on first use)
+_db: Optional[FormaDatabase] = None
 
 
-def get_tracker(db_path: str = None, max_records: int = 100) -> RequestTracker:
-    """Get or create the global tracker instance."""
-    global _tracker
-    if _tracker is None:
-        _tracker = RequestTracker(
-            db_path=db_path or "./tracker_data/forma_tracker.db", max_records=max_records
-        )
-    return _tracker
+def get_db(db_path: str = None, max_records: int = 100) -> FormaDatabase:
+    """Get or create the global database instance."""
+    global _db
+    if _db is None:
+        _db = FormaDatabase(db_path=db_path or "./data/forma.db", max_records=max_records)
+    return _db

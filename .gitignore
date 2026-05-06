@@ -98,9 +98,8 @@ dataset/
 webui/node_modules/
 webui_dist/
 
-# Tracker database
-tracker_data/
-tracker.db
+# Forma database (system data + upstreams + request history)
+data/
 
 # Server management
 .server.pid

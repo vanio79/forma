@@ -28,6 +28,17 @@ For each chat completion request, Forma executes this pipeline:
 
 5. **Store** - Persists newly extracted data in background (async, fire-and-forget)
 
+### Multi-Upstream Support
+
+Forma supports multiple upstream API configurations with model-based routing:
+
+- **Local Model Name** - The name clients use in their requests (routing key)
+- **Upstream Model Name** - The model name sent to the upstream API
+
+Example: Client sends `{"model": "gemma-local"}` → Forma routes to configured upstream → sends `{"model": "gemma-4-e4b-it"}` to the upstream API.
+
+Upstreams are configured via the Web UI and stored in the Forma database, not in config files.
+
 ### Storage Architecture
 
 Forma uses **GrafitoDB** - a SQLite-backed database that combines graph and vector storage in a single file:
@@ -36,6 +47,7 @@ Forma uses **GrafitoDB** - a SQLite-backed database that combines graph and vect
 |-----------|---------|-----|
 | Entities & Relationships | Graph (GrafitoDB) | Efficient traversal of entity connections |
 | Facts & Recipes | Vector Index (GrafitoDB) | Semantic similarity search |
+| Upstreams & Request History | SQLite (Forma DB) | System configuration and tracking |
 
 **Benefits of GrafitoDB:**
 - Single SQLite file - minimal file descriptor usage
@@ -56,14 +68,30 @@ score = confidence × similarity × time_decay
 
 ## Web UI
 
-Forma includes a Vue 3 SPA Web UI for visualizing requests, extractions, and retrievals:
+Forma includes a Vue 3 SPA Web UI for visualizing requests, extractions, retrievals, and managing upstreams:
 
 - **Dashboard**: Overview of system activity
 - **Requests List**: Browse recent requests with detailed information
 - **Extractions View**: See entities, relationships, facts, and recipes extracted from each request
 - **Retrievals View**: See context retrieved for augmentation with confidence and scores
+- **Upstreams**: Configure upstream API endpoints with model name mapping
 
 Access the Web UI at: `http://localhost:8000`
+
+### Upstreams Management
+
+Configure upstreams via the Web UI at `http://localhost:8000/upstreams`:
+
+| Field | Description |
+|-------|-------------|
+| **Local Model Name** | The model name clients send (routing key) |
+| **Upstream Model Name** | The model name sent to the upstream API (optional, defaults to local name) |
+| **Base URL** | The upstream API endpoint (e.g., `http://192.168.68.10:1234/v1`) |
+| **API Key** | Authentication key (optional for local servers) |
+| **Timeout** | Request timeout in seconds |
+| **Enabled** | Whether this upstream is active |
+
+When a request arrives with a model name, Forma looks up the matching upstream and forwards the request. If no upstream is configured for that model, an error is returned.
 
 ### Request Detail Sections
 
@@ -91,7 +119,10 @@ pip install -e ".[dev]"
 
 # Copy environment file and configure
 cp .env.example .env
-# Edit .env with your upstream API settings
+# Edit .env with your extractor settings (upstreams configured via Web UI)
+
+# Build the Web UI frontend
+cd webui && npm install && npm run build && cd ..
 
 # Run the proxy using the server management script
 ./server.sh start
@@ -103,6 +134,12 @@ uv run python -m forma.main
 ```
 
 The server runs at `http://localhost:8000` by default.
+
+**First steps after startup:**
+1. Open `http://localhost:8000` in your browser
+2. Go to **Upstreams** page and add an upstream configuration
+3. Set the **Local Model Name** to what your clients will use
+4. Set the **Upstream Model Name** to what the upstream API expects
 
 **Note**: On first startup, Forma will download the embedding model (`all-MiniLM-L6-v2`, ~90MB) to `./models/`. Subsequent starts load from cache - no network requests.
 
@@ -126,7 +163,7 @@ The script manages:
 
 ## Configuration
 
-Edit `.env` to configure. All settings are optional except the upstream endpoint.
+Edit `.env` to configure. Upstreams are configured via the Web UI, not in `.env`.
 
 ### Server
 
@@ -136,28 +173,19 @@ Edit `.env` to configure. All settings are optional except the upstream endpoint
 | `PORT` | `8000` | Server port |
 | `DEBUG` | `false` | Enable debug mode with auto-reload |
 
-### Upstream API (Required)
-
-The OpenAI-compatible API that Forma proxies to:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | Upstream API URL |
-| `UPSTREAM_API_KEY` | `""` | API key (leave empty for local servers) |
-| `UPSTREAM_TIMEOUT` | `300.0` | Request timeout in seconds |
-| `MODEL_MAPPING` | `""` | Map local model names to upstream (format: `local:upstream,local2:upstream2`) |
-
-### Extraction LLM (Optional)
+### Extraction LLM
 
 LLM used internally for extracting entities/facts/recipes:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EXTRACTOR_BASE_URL` | `""` | Extraction endpoint URL (empty = use upstream) |
+| `EXTRACTOR_BASE_URL` | `""` | Extraction endpoint URL (empty = use upstream from database) |
 | `EXTRACTOR_API_KEY` | `""` | API key for extraction endpoint |
-| `EXTRACTOR_MODEL_NAME` | `""` | Model for extraction tasks |
+| `EXTRACTOR_MODEL_NAME` | `""` | Model for extraction tasks (required) |
 | `EXTRACTOR_TIMEOUT` | `120.0` | Extraction timeout (may need time for complex extraction) |
 | `EXTRACTOR_SEND_REASONING_PARAMS` | `false` | Send reasoning_effort/enable_thinking params (not supported by all APIs) |
+
+If `EXTRACTOR_BASE_URL` is empty, Forma will use the upstream configured for `EXTRACTOR_MODEL_NAME` in the database.
 
 ### GrafitoDB Storage
 
@@ -172,39 +200,31 @@ LLM used internally for extracting entities/facts/recipes:
 - `all-MiniLM-L6-v2`: 384 dimensions
 - `all-mpnet-base-v2`: 768 dimensions
 
-### Request Tracker (Web UI)
+### Request History (Web UI)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRACKER_ENABLED` | `true` | Enable request tracking for Web UI |
-| `TRACKER_DB_PATH` | `./tracker_data/forma_tracker.db` | Tracker SQLite database path |
-| `TRACKER_MAX_RECORDS` | `100` | Maximum request records to keep (older pruned) |
+| `HISTORY_ENABLED` | `true` | Enable request tracking for Web UI |
+| `FORMA_DB_PATH` | `./data/forma.db` | Forma database path (upstreams + request history) |
+| `HISTORY_MAX_RECORDS` | `100` | Maximum request records to keep (older pruned) |
 
-### Example: LM Studio + OpenAI
+### Example: LM Studio
 
 ```env
-# Use OpenAI for chat completions
-UPSTREAM_BASE_URL=https://api.openai.com/v1
-UPSTREAM_API_KEY=sk-your-key
-
-# Use LM Studio for extraction (no auth needed)
+# Extraction endpoint (LM Studio doesn't need auth)
 EXTRACTOR_BASE_URL=http://localhost:1234/v1
+EXTRACTOR_API_KEY=
 EXTRACTOR_MODEL_NAME=gemma-4-e4b-it
-```
 
-### Example: Fully Local (LM Studio)
-
-```env
-UPSTREAM_BASE_URL=http://localhost:1234/v1
-UPSTREAM_API_KEY=
-
-EXTRACTOR_BASE_URL=http://localhost:1234/v1
-EXTRACTOR_MODEL_NAME=smollm3-3b-128k
-
-# GrafitoDB defaults work well for local setup
+# GrafitoDB defaults work well
 GRAFITODB_PATH=./grafito_data/forma.db
 GRAFITODB_MODEL_CACHE_PATH=./models
 ```
+
+Then configure upstreams via Web UI:
+- Add upstream with **Local Model Name**: `gemma-local`
+- Set **Upstream Model Name**: `gemma-4-e4b-it`
+- Set **Base URL**: `http://localhost:1234/v1`
 
 ## Usage
 
@@ -213,14 +233,15 @@ Forma is fully OpenAI-compatible. Point any OpenAI SDK or client to it:
 ```python
 from openai import OpenAI
 
+# Configure client to use Forma
 client = OpenAI(
     base_url="http://localhost:8000/v1",
-    api_key="any-key-works"  # Forma forwards to upstream
+    api_key="any-key-works"  # Forma doesn't validate, forwards to upstream
 )
 
-# Normal chat - Forma extracts and stores automatically
+# Use the model name you configured in the Upstreams page
 response = client.chat.completions.create(
-    model="gpt-4",
+    model="gemma-local",  # This is the Local Model Name from your upstream config
     messages=[
         {"role": "user", "content": "My name is Alice and I work at Acme Corp."},
         {"role": "assistant", "content": "Hello Alice! Nice to meet you."},
@@ -230,6 +251,8 @@ response = client.chat.completions.create(
 # Response includes retrieved context about Alice
 ```
 
+**Important**: Use the **Local Model Name** from your upstream configuration, not the upstream's actual model name.
+
 ## API Endpoints
 
 ### OpenAI-Compatible
@@ -237,7 +260,7 @@ response = client.chat.completions.create(
 | Endpoint | Description |
 |----------|-------------|
 | `GET /health` | Health check |
-| `GET /v1/models` | List available models |
+| `GET /v1/models` | List available models (returns models from configured upstream) |
 | `POST /v1/chat/completions` | Chat completions (supports streaming) |
 | `POST /v1/completions` | Legacy completions |
 
@@ -267,7 +290,13 @@ curl -X POST http://localhost:8000/admin/clear
 | `GET /ui/stats` | Get summary statistics for dashboard |
 | `GET /ui/requests` | Get list of recent requests |
 | `GET /ui/requests/{id}` | Get detailed request information |
-| `DELETE /ui/clear` | Clear all tracking data |
+| `DELETE /ui/clear` | Clear all request history |
+| `GET /ui/upstreams` | Get all upstream configurations |
+| `POST /ui/upstreams` | Create new upstream |
+| `GET /ui/upstreams/{id}` | Get specific upstream |
+| `PUT /ui/upstreams/{id}` | Update upstream |
+| `DELETE /ui/upstreams/{id}` | Delete upstream |
+| `POST /ui/upstreams/reload` | Reload upstreams from database |
 
 ## Extraction
 
@@ -315,7 +344,7 @@ MAX_QUESTIONS=50 uv run python benchmarks/longmemeval/run_benchmark.py
 
 **Prerequisites:**
 - Forma server running at `http://localhost:8000`
-- Direct model endpoint available (configured in `.env`)
+- Upstream configured via Web UI for the benchmark model
 - Benchmark data file at `benchmarks/longmemeval/data/longmemeval_oracle.json`
 
 The benchmark compares Forma (with RAG retrieval) against the direct upstream model, measuring how much information is retained from overflowed context. Results are saved to `benchmarks/longmemeval/results/`.
@@ -360,17 +389,17 @@ cd webui && npm run build
 
 ```
 Request → Extract → Retrieve → Augment → Forward → Response
-                                                     ↓
-                                              Background Store
-                                              (async, fire-and-forget)
+                                                      ↓
+                                               Background Store
+                                               (async, fire-and-forget)
 ```
 
 ### Storage Backend
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| **GrafitoDB** | SQLite + Graph + Vector | Single-file database for all storage |
-| **TrackerDB** | SQLite | Request tracking for Web UI |
+| **GrafitoDB** | SQLite + Graph + Vector | Entity/relationship/fact/recipe storage |
+| **Forma DB** | SQLite | Upstreams configuration + request history |
 
 GrafitoDB provides:
 - **Graph storage**: Entities and relationships with Cypher query support
@@ -386,7 +415,7 @@ GrafitoDB provides:
 | **Augment** | Context + Prompt | Augmented user message |
 | **Forward** | Augmented request | Upstream API response |
 | **Store** | Extracted data | Persisted to GrafitoDB (async) |
-| **Track** | Request data | Recorded to TrackerDB |
+| **Track** | Request data | Recorded to Forma DB |
 
 ## Project Structure
 
@@ -398,28 +427,33 @@ forma/
 │   ├── config.py            # Configuration management
 │   ├── extractor.py         # Entity/fact/recipe extraction
 │   ├── storage.py           # GrafitoDB storage backend
-│   ├── tracker.py           # Request tracking for Web UI
+│   ├── forma_db.py          # Forma database (upstreams + request history)
+│   ├── upstream_manager.py  # Multi-upstream routing
 │   ├── api.py               # Web UI API endpoints
-│   ├── proxy.py             # OpenAI API proxy
+│   ├── proxy.py             # OpenAI API proxy with upstream routing
 │   └── prompts/
 │       └── extraction.txt   # Extraction prompt template
 ├── webui/                   # Vue 3 SPA frontend
 │   ├── src/
 │   │   ├── components/
-│   │   │   └ RequestsList.vue
-│   │   ├── views/
-│   │   ├── api.ts
-│   │   ├── types/
+│   │   │   ├── Dashboard.vue
+│   │   │   ├── RequestsList.vue
+│   │   │   ├── RequestDetail.vue
+│   │   │   └── Upstreams.vue
+│   │   ├── api.ts           # API client
+│   │   ├── types/           # TypeScript types
 │   │   └── main.ts
-│   └ package.json
+│   ├── package.json
 │   └ vite.config.ts
 ├── webui_dist/              # Built frontend (served by FastAPI)
+├── data/                    # Forma database
+│   └── forma.db             # Upstreams + request history
 ├── grafito_data/            # GrafitoDB database
-├── tracker_data/            # Tracker database
+│   └── forma.db             # Entities, relationships, facts, recipes
 ├── models/                  # Cached embedding models
 ├── logs/                    # Runtime logs
 │   ├── extractions.jsonl
-│   └ retrievals.jsonl
+│   ├── retrievals.jsonl
 │   └ server.log
 └── benchmarks/              # LongMemEval benchmark
 ```

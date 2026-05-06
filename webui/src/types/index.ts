@@ -11,6 +11,7 @@ export interface Stats {
     facts: number;
     recipes: number;
   };
+  upstream_count: number;
 }
 
 export interface RequestListItem {
@@ -68,4 +69,34 @@ export interface RequestFullDetail {
   request: RequestDetail;
   extractions: ExtractionsByType;
   retrievals: RetrievalsByType;
+}
+
+export interface Upstream {
+  id: string;
+  name: string; // Local model name used for routing
+  upstream_model: string; // Model name to send to upstream API
+  base_url: string;
+  api_key: string;
+  timeout: number;
+  is_enabled: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CreateUpstreamRequest {
+  name: string;
+  upstream_model?: string;
+  base_url: string;
+  api_key?: string;
+  timeout?: number;
+  is_enabled?: boolean;
+}
+
+export interface UpdateUpstreamRequest {
+  name?: string;
+  upstream_model?: string;
+  base_url?: string;
+  api_key?: string;
+  timeout?: number;
+  is_enabled?: boolean;
 }

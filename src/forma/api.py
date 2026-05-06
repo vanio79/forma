@@ -1,26 +1,34 @@
 """Web UI API endpoints for Forma.
 
-Provides REST endpoints for the SPA frontend to retrieve tracking data.
+Provides REST endpoints for the SPA frontend to retrieve request history and manage upstreams.
 """
 
 import logging
+import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from forma.tracker import get_tracker
+from forma.forma_db import get_db
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ui", tags=["ui"])
 
 
+def _get_proxy():
+    """Get the proxy instance (lazy loading to avoid circular imports)."""
+    from forma.main import proxy
+
+    return proxy
+
+
 @router.get("/stats")
 async def get_stats():
     """Get summary statistics for the dashboard."""
-    tracker = get_tracker()
-    stats = tracker.get_stats()
+    db = get_db()
+    stats = db.get_stats()
     return JSONResponse(stats)
 
 
@@ -30,8 +38,8 @@ async def get_requests(
     offset: int = Query(default=0, ge=0),
 ):
     """Get list of recent requests."""
-    tracker = get_tracker()
-    requests = tracker.get_requests(limit=limit, offset=offset)
+    db = get_db()
+    requests = db.get_requests(limit=limit, offset=offset)
 
     # Format for frontend
     return JSONResponse(
@@ -62,8 +70,8 @@ async def get_requests(
 @router.get("/requests/{request_id}")
 async def get_request_detail(request_id: str):
     """Get detailed information for a specific request."""
-    tracker = get_tracker()
-    detail = tracker.get_request_detail(request_id)
+    db = get_db()
+    detail = db.get_request_detail(request_id)
 
     if not detail:
         raise HTTPException(status_code=404, detail="Request not found")
@@ -122,8 +130,170 @@ async def get_request_detail(request_id: str):
 
 
 @router.delete("/clear")
-async def clear_tracking_data():
-    """Clear all tracking data."""
-    tracker = get_tracker()
-    tracker.clear_all()
-    return JSONResponse({"status": "ok", "message": "All tracking data cleared"})
+async def clear_data():
+    """Clear all request history data."""
+    db = get_db()
+    db.clear_all()
+    return JSONResponse({"status": "ok", "message": "All request history cleared"})
+
+
+# === Upstream Management ===
+
+
+@router.get("/upstreams")
+async def get_upstreams():
+    """Get all upstream configurations."""
+    db = get_db()
+    upstreams = db.get_upstreams()
+    return JSONResponse({"upstreams": upstreams})
+
+
+@router.post("/upstreams")
+async def create_upstream(
+    name: str = Query(..., min_length=1, max_length=100),
+    upstream_model: str = Query(default="", max_length=100),
+    base_url: str = Query(..., min_length=1),
+    api_key: str = Query(default=""),
+    timeout: float = Query(default=300.0, ge=1.0, le=600.0),
+    is_enabled: bool = Query(default=True),
+):
+    """Create a new upstream configuration.
+
+    Args:
+        name: Local model name (routing key - client requests with this model go to this upstream)
+        upstream_model: Model name to send to upstream API (if empty, uses name)
+        base_url: Upstream API base URL
+        api_key: API key for authentication
+        timeout: Request timeout in seconds
+        is_enabled: Whether this upstream is enabled
+    """
+    db = get_db()
+
+    # Check if name already exists
+    existing = db.get_upstream_by_name(name)
+    if existing:
+        raise HTTPException(status_code=400, detail="Upstream name already exists")
+
+    upstream_id = str(uuid.uuid4())
+    db.create_upstream(
+        id=upstream_id,
+        name=name,
+        upstream_model=upstream_model,
+        base_url=base_url.rstrip("/"),
+        api_key=api_key,
+        timeout=timeout,
+        is_enabled=is_enabled,
+    )
+
+    # Reload upstreams in proxy
+    proxy = _get_proxy()
+    if proxy:
+        proxy.reload_upstreams()
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "message": "Upstream created",
+            "upstream": db.get_upstream_by_id(upstream_id),
+        }
+    )
+
+
+@router.get("/upstreams/{upstream_id}")
+async def get_upstream(upstream_id: str):
+    """Get a specific upstream configuration."""
+    db = get_db()
+    upstream = db.get_upstream_by_id(upstream_id)
+
+    if not upstream:
+        raise HTTPException(status_code=404, detail="Upstream not found")
+
+    return JSONResponse({"upstream": upstream})
+
+
+@router.put("/upstreams/{upstream_id}")
+async def update_upstream(
+    upstream_id: str,
+    name: str = Query(default=None, min_length=1, max_length=100),
+    upstream_model: str = Query(default=None, max_length=100),
+    base_url: str = Query(default=None, min_length=1),
+    api_key: str = Query(default=None),
+    timeout: float = Query(default=None, ge=1.0, le=600.0),
+    is_enabled: bool = Query(default=None),
+):
+    """Update an upstream configuration.
+
+    Args:
+        name: Local model name (routing key)
+        upstream_model: Model name to send to upstream API (if empty, uses name)
+        base_url: Upstream API base URL
+        api_key: API key for authentication
+        timeout: Request timeout in seconds
+        is_enabled: Whether this upstream is enabled
+    """
+    db = get_db()
+
+    upstream = db.get_upstream_by_id(upstream_id)
+    if not upstream:
+        raise HTTPException(status_code=404, detail="Upstream not found")
+
+    # Check name uniqueness if changing
+    if name and name != upstream["name"]:
+        existing = db.get_upstream_by_name(name)
+        if existing:
+            raise HTTPException(status_code=400, detail="Upstream name already exists")
+
+    # Update with provided values, keeping existing for None
+    db.update_upstream(
+        id=upstream_id,
+        name=name or upstream["name"],
+        upstream_model=upstream_model
+        if upstream_model is not None
+        else upstream.get("upstream_model", ""),
+        base_url=(base_url or upstream["base_url"]).rstrip("/"),
+        api_key=api_key if api_key is not None else upstream["api_key"],
+        timeout=timeout if timeout is not None else upstream["timeout"],
+        is_enabled=is_enabled if is_enabled is not None else upstream["is_enabled"],
+    )
+
+    # Reload upstreams in proxy
+    proxy = _get_proxy()
+    if proxy:
+        proxy.reload_upstreams()
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "message": "Upstream updated",
+            "upstream": db.get_upstream_by_id(upstream_id),
+        }
+    )
+
+
+@router.delete("/upstreams/{upstream_id}")
+async def delete_upstream(upstream_id: str):
+    """Delete an upstream configuration."""
+    db = get_db()
+
+    upstream = db.get_upstream_by_id(upstream_id)
+    if not upstream:
+        raise HTTPException(status_code=404, detail="Upstream not found")
+
+    db.delete_upstream(upstream_id)
+
+    # Reload upstreams in proxy
+    proxy = _get_proxy()
+    if proxy:
+        proxy.reload_upstreams()
+
+    return JSONResponse({"status": "ok", "message": "Upstream deleted"})
+
+
+@router.post("/upstreams/reload")
+async def reload_upstreams():
+    """Reload upstream configurations from database."""
+    proxy = _get_proxy()
+    if proxy:
+        proxy.reload_upstreams()
+        return JSONResponse({"status": "ok", "message": "Upstreams reloaded"})
+    return JSONResponse({"status": "error", "message": "Proxy not initialized"})

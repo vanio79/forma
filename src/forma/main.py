@@ -20,7 +20,8 @@ from forma.config import get_settings
 from forma.extractor import Extractor
 from forma.proxy import OpenAIProxy
 from forma.storage import Storage
-from forma.tracker import RequestTracker, get_tracker
+from forma.forma_db import FormaDatabase, get_db
+from forma.upstream_manager import UpstreamManager
 
 # Configure logging
 logging.basicConfig(
@@ -36,7 +37,8 @@ LOGS_DIR = Path(__file__).parent.parent.parent / "logs"
 proxy: OpenAIProxy
 extractor: Extractor
 storage: Storage
-tracker: RequestTracker
+db: FormaDatabase
+upstream_manager: UpstreamManager
 _storage_lock = asyncio.Lock()
 
 
@@ -109,9 +111,23 @@ async def _store_extraction_background(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
     """Manage application lifespan."""
-    global proxy, extractor, storage, tracker
+    global proxy, extractor, storage, db, upstream_manager
     settings = get_settings()
-    proxy = OpenAIProxy(settings)
+
+    # Initialize database for web UI and upstreams
+    if settings.history_enabled:
+        db = FormaDatabase(
+            db_path=settings.forma_db_path,
+            max_records=settings.history_max_records,
+        )
+    else:
+        db = None
+
+    # Initialize upstream manager (loads upstreams from database)
+    upstream_manager = UpstreamManager(db)
+
+    # Initialize proxy with upstream manager
+    proxy = OpenAIProxy(settings, upstream_manager)
     extractor = Extractor(settings, proxy=proxy)
     storage = Storage(
         grafitodb_path=settings.grafitodb_path,
@@ -120,24 +136,15 @@ async def lifespan(app: FastAPI) -> Any:
         grafitodb_model_cache_path=settings.grafitodb_model_cache_path,
     )
 
-    # Initialize tracker for web UI
-    if settings.tracker_enabled:
-        tracker = RequestTracker(
-            db_path=settings.tracker_db_path,
-            max_records=settings.tracker_max_records,
-        )
-    else:
-        tracker = None
+    if db:
+        logger.info(f"Request history enabled - max records: {settings.history_max_records}")
 
-    logger.info(f"Forma proxy starting - upstream: {settings.upstream_base_url}")
-    if settings.extractor_base_url:
-        logger.info(
-            f"Extraction endpoint: {settings.extractor_base_url} "
-            f"(model: {settings.extractor_model_name})"
-        )
-
-    if tracker:
-        logger.info(f"Request tracking enabled - max records: {settings.tracker_max_records}")
+    # Log upstream configuration
+    upstreams = upstream_manager.get_all_upstreams()
+    logger.info(f"Upstream configurations: {len(upstreams)}")
+    for u in upstreams:
+        status_str = "enabled" if u.is_enabled else "disabled"
+        logger.info(f"  - {u.name}: {u.base_url} ({status_str})")
 
     # Log storage stats
     stats = storage.get_stats()
@@ -152,8 +159,8 @@ async def lifespan(app: FastAPI) -> Any:
     await proxy.close()
     extractor.close()
     storage.close()
-    if tracker:
-        tracker.close()
+    if db:
+        db.close()
     if _retrieval_log_file is not None:
         with contextlib.suppress(Exception):
             _retrieval_log_file.close()
@@ -385,10 +392,10 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
         except Exception as e:
             logger.error(f"Assistant response extraction error: {e}")
 
-    # Step 6: Track request for web UI (if tracker enabled)
-    if tracker:
+    # Step 6: Record request for web UI (if database enabled)
+    if db:
         try:
-            request_id = tracker.record_request(
+            request_id = db.record_request(
                 model=model,
                 user_prompt=user_prompt,
                 messages=messages,
@@ -400,7 +407,7 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
 
             # Record extractions
             if extraction_result:
-                tracker.record_extractions_batch(
+                db.record_extractions_batch(
                     request_id=request_id,
                     entities=extraction_result.entities,
                     relationships=extraction_result.relationships,
@@ -410,12 +417,12 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
 
             # Record retrievals
             if retrieval_results:
-                tracker.record_retrievals_batch(
+                db.record_retrievals_batch(
                     request_id=request_id,
                     results=retrieval_results,
                 )
         except Exception as e:
-            logger.error(f"Tracking error: {e}")
+            logger.error(f"Database recording error: {e}")
 
     # Step 7: Store all extracted data in background (fire-and-forget)
     entities = extraction_result.entities if extraction_result else []
