@@ -68,13 +68,14 @@ score = confidence × similarity × time_decay
 
 ## Web UI
 
-Forma includes a Vue 3 SPA Web UI for visualizing requests, extractions, retrievals, and managing upstreams:
+Forma includes a Vue 3 SPA Web UI for visualizing requests, extractions, retrievals, managing upstreams, and interactive chat:
 
 - **Dashboard**: Overview of system activity
 - **Requests List**: Browse recent requests with detailed information
 - **Extractions View**: See entities, relationships, facts, and recipes extracted from each request
 - **Retrievals View**: See context retrieved for augmentation with confidence and scores
 - **Upstreams**: Configure upstream API endpoints with model name mapping
+- **Chat**: Interactive chat interface with streaming responses and automatic context compaction
 
 Access the Web UI at: `http://localhost:8000`
 
@@ -92,6 +93,30 @@ Configure upstreams via the Web UI at `http://localhost:8000/upstreams`:
 | **Enabled** | Whether this upstream is active |
 
 When a request arrives with a model name, Forma looks up the matching upstream and forwards the request. If no upstream is configured for that model, an error is returned.
+
+### Chat Interface
+
+The Chat page (`http://localhost:8000/chat`) provides an interactive chat experience with:
+
+**Features:**
+- **Streaming Responses**: Assistant responses stream in real-time, showing content as it's generated
+- **Context Compaction**: When token usage reaches 95% of the configured context size, older messages are automatically summarized
+  - Summary appears at the end of the chat and remains visible
+  - Keeps the most recent messages (last 4 messages = 2 exchanges)
+  - Compaction progress shown with step indicators
+- **Token Tracking**: Real-time token count display with visual progress bar
+- **Auto-Focus**: Input field automatically focuses after responses complete, allowing immediate typing of the next message
+- **Context Size Control**: Adjustable context window size (256-128000 tokens)
+
+**Context Compaction Details:**
+When context reaches the threshold, Forma:
+1. Analyzes messages to summarize (messages older than the last 2 exchanges)
+2. Generates a summary using streaming (visible as it's generated)
+3. Displays summary with "📝 Context Summary" label at the end of the chat
+4. Removes summarized messages, keeping recent context
+5. Resets token count to reflect the compacted state
+
+This approach (similar to OpenCode) ensures conversations can continue indefinitely without losing important context from earlier exchanges.
 
 ### Request Detail Sections
 
@@ -261,10 +286,12 @@ response = client.chat.completions.create(
 |----------|-------------|
 | `GET /health` | Health check |
 | `GET /v1/models` | List available models (returns models from configured upstream) |
-| `POST /v1/chat/completions` | Chat completions (supports streaming) |
+| `POST /v1/chat/completions` | Chat completions (supports streaming) - **used by Web UI Chat interface** |
 | `POST /v1/completions` | Legacy completions |
 
 **Note**: The `/v1/embeddings` endpoint is not provided - embeddings are generated internally using SentenceTransformer.
+
+The Web UI Chat interface uses the `/v1/chat/completions` endpoint with streaming enabled to provide real-time response updates.
 
 ### Admin Endpoints
 
@@ -297,6 +324,22 @@ curl -X POST http://localhost:8000/admin/clear
 | `PUT /ui/upstreams/{id}` | Update upstream |
 | `DELETE /ui/upstreams/{id}` | Delete upstream |
 | `POST /ui/upstreams/reload` | Reload upstreams from database |
+
+**Chat Feature Types:**
+The Chat interface uses specific TypeScript types defined in `webui/src/types/index.ts`:
+
+| Type | Description |
+|------|-------------|
+| `ChatMessage` | Message with role, content, timestamp, and streaming flags |
+| `ChatCompletionChunk` | Streaming response chunk (SSE format) |
+| `TokenUsage` | Token count information from API responses |
+
+The `ChatMessage` type includes:
+- `role`: "user", "assistant", or "system"
+- `content`: Message text
+- `timestamp`: Unix timestamp
+- `isStreaming`: Flag for messages being streamed
+- `isCompacting`: Flag for compaction progress messages
 
 ## Extraction
 
@@ -383,6 +426,12 @@ uv run ruff check src/forma
 cd webui && npm run build
 ```
 
+**Web UI Development Notes:**
+- The Chat component (`webui/src/components/Chat.vue`) implements streaming using Server-Sent Events (SSE)
+- Streaming updates use Vue's reactivity by modifying array elements by index: `messages.value[index].content += chunk`
+- Context compaction triggers at 95% of configured context size
+- Auto-focus after responses uses `nextTick()` and `inputTextarea.value?.focus()`
+
 ## Architecture
 
 ### Request Pipeline
@@ -439,9 +488,10 @@ forma/
 │   │   │   ├── Dashboard.vue
 │   │   │   ├── RequestsList.vue
 │   │   │   ├── RequestDetail.vue
-│   │   │   └── Upstreams.vue
-│   │   ├── api.ts           # API client
-│   │   ├── types/           # TypeScript types
+│   │   │   ├── Upstreams.vue
+│   │   │   └── Chat.vue      # Interactive chat with streaming & compaction
+│   │   ├── api.ts           # API client (includes streaming chat completion)
+│   │   ├── types/           # TypeScript types (includes ChatMessage types)
 │   │   └── main.ts
 │   ├── package.json
 │   └ vite.config.ts

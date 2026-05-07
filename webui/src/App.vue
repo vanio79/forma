@@ -9,6 +9,7 @@
           <router-link to="/" class="nav-link">Dashboard</router-link>
           <router-link to="/requests" class="nav-link">Requests</router-link>
           <router-link to="/upstreams" class="nav-link">Upstreams</router-link>
+          <router-link to="/chat" class="nav-link">Chat</router-link>
         </nav>
       </div>
     </header>
@@ -16,7 +17,7 @@
       <router-view />
     </main>
     <footer class="footer">
-      <p>Forma Request Tracker &copy; 2026</p>
+      <p>Forma - Autonomous Cognitive Proxy &copy; 2026</p>
     </footer>
   </div>
 </template>

@@ -1,8 +1,9 @@
 /** API client for Forma Web UI */
 
-import type { Stats, RequestListItem, RequestFullDetail, Upstream } from "./types";
+import type { Stats, RequestListItem, RequestFullDetail, Upstream, ChatMessage, ChatCompletionResponse } from "./types";
 
 const API_BASE = "/ui";
+const CHAT_API_BASE = "/v1";
 
 async function fetchJSON<T>(url: string): Promise<T> {
   const response = await fetch(url);
@@ -104,5 +105,132 @@ export async function deleteUpstream(upstreamId: string): Promise<{ status: stri
     const errorData = await response.json().catch(() => ({ detail: "Unknown error" }));
     throw new Error(errorData.detail || `API error: ${response.status}`);
   }
+  return response.json();
+}
+
+// === Chat ===
+
+/**
+ * Stream a chat completion request.
+ * 
+ * @param model - Model name to use
+ * @param messages - Chat messages
+ * @param onChunk - Callback for each chunk of content
+ * @param onComplete - Callback when stream completes
+ * @param onError - Callback for errors
+ */
+export async function streamChatCompletion(
+  model: string,
+  messages: ChatMessage[],
+  onChunk: (chunk: string) => void,
+  onComplete: () => void,
+  onError: (error: string) => void
+): Promise<void> {
+  const response = await fetch(`${CHAT_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      stream: true,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({ detail: "Unknown error" }));
+    onError(errorData.detail || `API error: ${response.status}`);
+    return;
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    onError("No response body");
+    return;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      
+      // Process SSE events
+      const lines = buffer.split("\n");
+      buffer = ""; // Reset buffer, will add back incomplete line
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        
+        if (i === lines.length - 1 && !line.endsWith("\n")) {
+          // Incomplete line, keep in buffer
+          buffer = line;
+          continue;
+        }
+
+        if (line.startsWith("data: ")) {
+          const data = line.slice(6).trim();
+          
+          if (data === "[DONE]") {
+            onComplete();
+            return;
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+            const content = parsed.choices?.[0]?.delta?.content;
+            if (content) {
+              onChunk(content);
+            }
+          } catch {
+            // Ignore parse errors for malformed chunks
+          }
+        }
+      }
+    }
+
+    onComplete();
+  } catch (e) {
+    onError(e instanceof Error ? e.message : "Stream error");
+  }
+}
+
+/**
+ * Send a non-streaming chat completion request.
+ * Returns the full response with usage stats.
+ * 
+ * @param model - Model name to use
+ * @param messages - Chat messages
+ * @returns Promise with the completion response including usage stats
+ */
+export async function nonStreamingChatCompletion(
+  model: string,
+  messages: ChatMessage[]
+): Promise<ChatCompletionResponse> {
+  const response = await fetch(`${CHAT_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      stream: false,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({ detail: "Unknown error" }));
+    throw new Error(errorData.detail || `API error: ${response.status}`);
+  }
+
   return response.json();
 }

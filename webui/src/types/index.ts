@@ -100,3 +100,58 @@ export interface UpdateUpstreamRequest {
   timeout?: number;
   is_enabled?: boolean;
 }
+
+// === Chat Types ===
+
+export interface ChatMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+  timestamp?: number;
+  isStreaming?: boolean;  // For messages being streamed (assistant responses or compaction summaries)
+  isCompacting?: boolean; // For compaction progress messages
+}
+
+export interface ChatCompletionRequest {
+  model: string;
+  messages: ChatMessage[];
+  stream?: boolean;
+  max_tokens?: number;
+  temperature?: number;
+}
+
+export interface ChatCompletionChunk {
+  id: string;
+  object: string;
+  created: number;
+  model: string;
+  choices: {
+    index: number;
+    delta: {
+      role?: string;
+      content?: string;
+    };
+    finish_reason: string | null;
+  }[];
+}
+
+export interface TokenUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export interface ChatCompletionResponse {
+  id: string;
+  object: string;
+  created: number;
+  model: string;
+  choices: {
+    index: number;
+    message: {
+      role: string;
+      content: string;
+    };
+    finish_reason: string;
+  }[];
+  usage: TokenUsage;
+}
