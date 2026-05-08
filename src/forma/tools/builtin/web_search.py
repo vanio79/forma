@@ -3,7 +3,7 @@
 import time
 from typing import Any
 
-from ddgs import DDGS
+from duckduckgo_search import DDGS
 
 from forma.tools.base import SyncTool, ToolResult
 

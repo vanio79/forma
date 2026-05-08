@@ -10,8 +10,6 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from forma.forma_db import get_db
-
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ui", tags=["ui"])
@@ -24,10 +22,17 @@ def _get_proxy():
     return proxy
 
 
+def _get_db():
+    """Get the database instance from main (lazy loading to avoid circular imports)."""
+    from forma.main import db
+
+    return db
+
+
 @router.get("/stats")
 async def get_stats():
     """Get summary statistics for the dashboard."""
-    db = get_db()
+    db = _get_db()
     stats = db.get_stats()
     return JSONResponse(stats)
 
@@ -38,7 +43,7 @@ async def get_requests(
     offset: int = Query(default=0, ge=0),
 ):
     """Get list of recent requests."""
-    db = get_db()
+    db = _get_db()
     requests = db.get_requests(limit=limit, offset=offset)
 
     # Format for frontend
@@ -70,7 +75,7 @@ async def get_requests(
 @router.get("/requests/{request_id}")
 async def get_request_detail(request_id: str):
     """Get detailed information for a specific request."""
-    db = get_db()
+    db = _get_db()
     detail = db.get_request_detail(request_id)
 
     if not detail:
@@ -133,7 +138,7 @@ async def get_request_detail(request_id: str):
 @router.delete("/clear")
 async def clear_data():
     """Clear all request history data."""
-    db = get_db()
+    db = _get_db()
     db.clear_all()
     return JSONResponse({"status": "ok", "message": "All request history cleared"})
 
@@ -144,7 +149,7 @@ async def clear_data():
 @router.get("/upstreams")
 async def get_upstreams():
     """Get all upstream configurations."""
-    db = get_db()
+    db = _get_db()
     upstreams = db.get_upstreams()
     return JSONResponse({"upstreams": upstreams})
 
@@ -168,7 +173,7 @@ async def create_upstream(
         timeout: Request timeout in seconds
         is_enabled: Whether this upstream is enabled
     """
-    db = get_db()
+    db = _get_db()
 
     # Check if name already exists
     existing = db.get_upstream_by_name(name)
@@ -203,7 +208,7 @@ async def create_upstream(
 @router.get("/upstreams/{upstream_id}")
 async def get_upstream(upstream_id: str):
     """Get a specific upstream configuration."""
-    db = get_db()
+    db = _get_db()
     upstream = db.get_upstream_by_id(upstream_id)
 
     if not upstream:
@@ -232,7 +237,7 @@ async def update_upstream(
         timeout: Request timeout in seconds
         is_enabled: Whether this upstream is enabled
     """
-    db = get_db()
+    db = _get_db()
 
     upstream = db.get_upstream_by_id(upstream_id)
     if not upstream:
@@ -274,7 +279,7 @@ async def update_upstream(
 @router.delete("/upstreams/{upstream_id}")
 async def delete_upstream(upstream_id: str):
     """Delete an upstream configuration."""
-    db = get_db()
+    db = _get_db()
 
     upstream = db.get_upstream_by_id(upstream_id)
     if not upstream:

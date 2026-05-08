@@ -1,5 +1,6 @@
 """Base classes for tool definitions."""
 
+import asyncio
 import json
 import time
 from abc import ABC, abstractmethod
@@ -234,8 +235,8 @@ class SyncTool(Tool):
         raise NotImplementedError("Subclasses must implement execute_sync")
 
     async def execute(self, **kwargs: Any) -> ToolResult:
-        """Wrap sync execution in async."""
-        return self.execute_sync(**kwargs)
+        """Wrap sync execution in async thread to avoid blocking the event loop."""
+        return await asyncio.to_thread(self.execute_sync, **kwargs)
 
 
 class EchoTool(SyncTool):

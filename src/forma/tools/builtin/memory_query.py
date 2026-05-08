@@ -82,22 +82,23 @@ class QueryMemoryTool(Tool):
                     # Extract entity names from query for relationship matching
                     entity_names = self._extract_entity_names(query)
                     if entity_names:
-                        rels = self._storage.query_relationships(
-                            entities=entity_names,
-                            limit=limit,
-                        )
-                        for r in rels:
-                            results["items"].append(
-                                {
-                                    "type": "relationship",
-                                    "data": {
-                                        "subject": r.get("subject", ""),
-                                        "predicate": r.get("predicate", ""),
-                                        "object": r.get("object", ""),
-                                        "confidence": r.get("confidence", 0.9),
-                                    },
-                                }
+                        for entity_name in entity_names:
+                            rels = self._storage.query_relationships(
+                                subject=entity_name,
+                                n_results=limit,
                             )
+                            for r in rels:
+                                results["items"].append(
+                                    {
+                                        "type": "relationship",
+                                        "data": {
+                                            "subject": r.get("subject", ""),
+                                            "predicate": r.get("predicate", ""),
+                                            "object": r.get("object", ""),
+                                            "confidence": r.get("confidence", 0.9),
+                                        },
+                                    }
+                                )
                 except Exception as e:
                     results["relationship_error"] = str(e)
 
@@ -110,9 +111,9 @@ class QueryMemoryTool(Tool):
                             {
                                 "type": "fact",
                                 "data": {
-                                    "content": f.get("content", ""),
-                                    "confidence": f.get("confidence", 0.9),
-                                    "score": f.get("score", 0.0),
+                                    "content": f.get("document", ""),
+                                    "confidence": f.get("metadata", {}).get("confidence", 0.9),
+                                    "score": 1.0 - f.get("distance", 1.0),
                                 },
                             }
                         )
@@ -128,9 +129,9 @@ class QueryMemoryTool(Tool):
                             {
                                 "type": "recipe",
                                 "data": {
-                                    "content": r.get("content", ""),
-                                    "confidence": r.get("confidence", 0.9),
-                                    "score": r.get("score", 0.0),
+                                    "content": r.get("document", ""),
+                                    "confidence": r.get("metadata", {}).get("confidence", 0.9),
+                                    "score": 1.0 - r.get("distance", 1.0),
                                 },
                             }
                         )

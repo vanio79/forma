@@ -4,7 +4,7 @@ import contextlib
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -349,7 +349,7 @@ class Extractor:
     def _log_extraction(self, text: str, result: ExtractionResult) -> None:
         """Log extraction result to file."""
         log_entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "source_text": text[:500],  # Truncate for logging
             "raw_response": result.raw_response,  # Include raw response for debugging
             "extraction": result.to_dict(),
