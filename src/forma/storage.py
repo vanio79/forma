@@ -13,6 +13,14 @@ from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
+
+def _escape_cypher_string(value: str) -> str:
+    """Escape a string for safe use in Cypher queries.
+
+    Prevents injection by escaping single quotes and backslashes.
+    """
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
 # Vector index names for semantic search
 FACTS_VECTOR_INDEX = "facts_index"
 RECIPES_VECTOR_INDEX = "recipes_index"
@@ -202,7 +210,7 @@ class Storage:
         if not relationships:
             return 0
 
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(UTC).isoformat()
         count = 0
 
         for rel in relationships:
@@ -307,7 +315,7 @@ class Storage:
         if not facts:
             return 0
 
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(UTC).isoformat()
         documents = []
         duplicate_threshold = 0.05  # Very similar = duplicate
 
@@ -386,7 +394,7 @@ class Storage:
         if not recipes:
             return 0
 
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(UTC).isoformat()
         documents = []
         duplicate_threshold = 0.05  # Very similar = duplicate
 
@@ -620,8 +628,9 @@ class Storage:
                 # Get incoming relationships - find nodes that point to this entity
                 # Use Cypher query for efficiency
                 # Note: GrafitoDB Cypher doesn't support NOT IN, so we filter in Python
+                safe_subject = _escape_cypher_string(subject)
                 cypher = (
-                    "MATCH (e:Entity {name: '" + subject + "'}) "
+                    "MATCH (e:Entity {name: '" + safe_subject + "'}) "
                     "MATCH (source:Entity)-[r]->(e) "
                     "RETURN source.name AS source_name, r, r.confidence AS confidence, "
                     "r.extracted_at AS extracted_at "
@@ -690,16 +699,29 @@ class Storage:
         node_count = self.db.get_node_count()
         relationship_count = self.db.get_relationship_count()
 
-        # Count facts and recipes by label
-        facts_nodes = self.db.match_nodes(labels=["Fact"])
-        recipes_nodes = self.db.match_nodes(labels=["Recipe"])
+        # Count facts and recipes efficiently using Cypher COUNT
+        facts_count = 0
+        recipes_count = 0
+        try:
+            result = self.db.execute("MATCH (n:Fact) RETURN count(n) AS cnt")
+            if result:
+                facts_count = result[0].get("cnt", 0)
+        except Exception:
+            # Fallback: load nodes (slower but reliable)
+            facts_count = len(self.db.match_nodes(labels=["Fact"]))
+        try:
+            result = self.db.execute("MATCH (n:Recipe) RETURN count(n) AS cnt")
+            if result:
+                recipes_count = result[0].get("cnt", 0)
+        except Exception:
+            recipes_count = len(self.db.match_nodes(labels=["Recipe"]))
 
         return {
             "grafitodb": {
                 "nodes": node_count,
                 "relationships": relationship_count,
-                "facts": len(facts_nodes),
-                "recipes": len(recipes_nodes),
+                "facts": facts_count,
+                "recipes": recipes_count,
             },
         }
 
@@ -738,8 +760,8 @@ class Storage:
                 "facts": stats_before["grafitodb"]["facts"] - stats_after["grafitodb"]["facts"],
                 "recipes": stats_before["grafitodb"]["recipes"]
                 - stats_after["grafitodb"]["recipes"],
-                "entities": stats_before["grafitodb"]["entities"]
-                - stats_after["grafitodb"]["entities"],
+                "nodes": stats_before["grafitodb"]["nodes"]
+                - stats_after["grafitodb"]["nodes"],
                 "relationships": stats_before["grafitodb"]["relationships"]
                 - stats_after["grafitodb"]["relationships"],
             },

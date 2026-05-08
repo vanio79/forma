@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +68,7 @@ def _log_context_retrieval(
 ) -> None:
     """Log context retrieval to file for debugging."""
     log_entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "queries": {
             "entities_queries": entities_queries,
             "fact_query": fact_query,
@@ -107,6 +107,66 @@ async def _store_extraction_background(
                 )
         except Exception as e:
             logger.error(f"Background storage error: {e}")
+
+
+def _fire_and_forget(coro) -> None:
+    """Schedule a background task with error logging."""
+    task = asyncio.create_task(coro)
+    task.add_done_callback(_background_task_done)
+
+
+def _background_task_done(task: asyncio.Task) -> None:
+    """Callback for fire-and-forget tasks to log exceptions."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error(f"Background task failed: {exc}", exc_info=exc)
+
+
+def _record_request_to_db(
+    *,
+    model: str,
+    user_prompt: str,
+    messages: list[dict],
+    extraction_response: str,
+    extraction_result: Any,
+    extraction_latency: float,
+    augmented_prompt: str,
+    agent_response: str,
+    retrieval_results: list[dict],
+) -> None:
+    """Record a request and its extractions/retrievals to the database."""
+    if not db:
+        return
+    try:
+        extraction_prompt_text = (
+            extraction_result.extraction_prompt if extraction_result else ""
+        )
+        request_id = db.record_request(
+            model=model,
+            user_prompt=user_prompt,
+            messages=messages,
+            extraction_response=extraction_response,
+            extraction_prompt=extraction_prompt_text,
+            extraction_ms=extraction_latency,
+            augmented_prompt=augmented_prompt,
+            agent_response=agent_response,
+        )
+        if extraction_result:
+            db.record_extractions_batch(
+                request_id=request_id,
+                relationships=extraction_result.relationships,
+                facts=extraction_result.facts,
+                recipes=extraction_result.recipes,
+            )
+        if retrieval_results:
+            db.record_retrievals_batch(
+                request_id=request_id,
+                results=retrieval_results,
+            )
+    except Exception as e:
+        logger.error(f"Database recording error: {e}")
 
 
 async def _stream_with_realtime_events(
@@ -398,8 +458,8 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
                 )
                 logger.info(f"Context string length: {len(context_str)} chars")
 
-                # Augment first user message with context
-                for msg in messages:
+                # Augment LAST user message with context
+                for msg in reversed(messages):
                     if msg.get("role") == "user":
                         content = msg.get("content", "")
                         if isinstance(content, str):
@@ -591,38 +651,20 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
                 facts = extraction_result.facts if extraction_result else []
                 recipes = extraction_result.recipes if extraction_result else []
                 if relationships or facts or recipes:
-                    asyncio.create_task(_store_extraction_background(relationships, facts, recipes))
+                    _fire_and_forget(_store_extraction_background(relationships, facts, recipes))
 
                 # Record request in database
-                if db:
-                    try:
-                        extraction_prompt_text = (
-                            extraction_result.extraction_prompt if extraction_result else ""
-                        )
-                        request_id = db.record_request(
-                            model=model,
-                            user_prompt=user_prompt,
-                            messages=messages,
-                            extraction_response=extraction_response,
-                            extraction_prompt=extraction_prompt_text,
-                            extraction_ms=extraction_latency,
-                            augmented_prompt=augmented_prompt,
-                            agent_response="",  # Empty for streaming
-                        )
-                        if extraction_result:
-                            db.record_extractions_batch(
-                                request_id=request_id,
-                                relationships=extraction_result.relationships,
-                                facts=extraction_result.facts,
-                                recipes=extraction_result.recipes,
-                            )
-                        if retrieval_results:
-                            db.record_retrievals_batch(
-                                request_id=request_id,
-                                results=retrieval_results,
-                            )
-                    except Exception as e:
-                        logger.error(f"Database recording error: {e}")
+                _record_request_to_db(
+                    model=model,
+                    user_prompt=user_prompt,
+                    messages=messages,
+                    extraction_response=extraction_response,
+                    extraction_result=extraction_result,
+                    extraction_latency=extraction_latency,
+                    augmented_prompt=augmented_prompt,
+                    agent_response="",
+                    retrieval_results=retrieval_results,
+                )
 
             # Return streaming response with headers to disable buffering
             return StreamingResponse(
@@ -696,43 +738,23 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
         # If streaming and no tools, response is StreamingResponse - return directly
         if isinstance(response, StreamingResponse):
             # Record request without agent_response for streaming
-            if db:
-                try:
-                    extraction_prompt_text = (
-                        extraction_result.extraction_prompt if extraction_result else ""
-                    )
-                    request_id = db.record_request(
-                        model=model,
-                        user_prompt=user_prompt,
-                        messages=messages,
-                        extraction_response=extraction_response,
-                        extraction_prompt=extraction_prompt_text,
-                        extraction_ms=extraction_latency,
-                        augmented_prompt=augmented_prompt,
-                        agent_response="",  # Empty for streaming
-                    )
-
-                    if extraction_result:
-                        db.record_extractions_batch(
-                            request_id=request_id,
-                            relationships=extraction_result.relationships,
-                            facts=extraction_result.facts,
-                            recipes=extraction_result.recipes,
-                        )
-
-                    if retrieval_results:
-                        db.record_retrievals_batch(
-                            request_id=request_id,
-                            results=retrieval_results,
-                        )
-                except Exception as e:
-                    logger.error(f"Database recording error: {e}")
+            _record_request_to_db(
+                model=model,
+                user_prompt=user_prompt,
+                messages=messages,
+                extraction_response=extraction_response,
+                extraction_result=extraction_result,
+                extraction_latency=extraction_latency,
+                augmented_prompt=augmented_prompt,
+                agent_response="",
+                retrieval_results=retrieval_results,
+            )
 
             relationships = extraction_result.relationships if extraction_result else []
             facts = extraction_result.facts if extraction_result else []
             recipes = extraction_result.recipes if extraction_result else []
             if relationships or facts or recipes:
-                asyncio.create_task(
+                _fire_and_forget(
                     _store_extraction_background(
                         relationships,
                         facts,
@@ -748,46 +770,24 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
         agent_response = _get_agent_response(response)
 
     # Step 6: Record request for web UI (if database enabled)
-    if db:
-        try:
-            extraction_prompt_text = (
-                extraction_result.extraction_prompt if extraction_result else ""
-            )
-            request_id = db.record_request(
-                model=model,
-                user_prompt=user_prompt,
-                messages=messages,
-                extraction_response=extraction_response,
-                extraction_prompt=extraction_prompt_text,
-                extraction_ms=extraction_latency,
-                augmented_prompt=augmented_prompt,
-                agent_response=agent_response,
-            )
-
-            # Record extractions
-            if extraction_result:
-                db.record_extractions_batch(
-                    request_id=request_id,
-                    relationships=extraction_result.relationships,
-                    facts=extraction_result.facts,
-                    recipes=extraction_result.recipes,
-                )
-
-            # Record retrievals
-            if retrieval_results:
-                db.record_retrievals_batch(
-                    request_id=request_id,
-                    results=retrieval_results,
-                )
-        except Exception as e:
-            logger.error(f"Database recording error: {e}")
+    _record_request_to_db(
+        model=model,
+        user_prompt=user_prompt,
+        messages=messages,
+        extraction_response=extraction_response,
+        extraction_result=extraction_result,
+        extraction_latency=extraction_latency,
+        augmented_prompt=augmented_prompt,
+        agent_response=agent_response,
+        retrieval_results=retrieval_results,
+    )
 
     # Step 7: Store all extracted data in background (fire-and-forget)
     relationships = extraction_result.relationships if extraction_result else []
     facts = extraction_result.facts if extraction_result else []
     recipes = extraction_result.recipes if extraction_result else []
     if relationships or facts or recipes:
-        asyncio.create_task(
+        _fire_and_forget(
             _store_extraction_background(
                 relationships,
                 facts,

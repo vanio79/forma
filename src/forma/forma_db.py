@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -193,7 +193,7 @@ class FormaDatabase:
             The request ID (UUID)
         """
         request_id = str(uuid.uuid4())
-        timestamp = int(datetime.utcnow().timestamp())
+        timestamp = int(datetime.now(UTC).timestamp())
         history = self._format_history(messages)
 
         with self._transaction() as conn:
@@ -480,7 +480,7 @@ class FormaDatabase:
             timeout: Request timeout in seconds
             is_enabled: Whether this upstream is enabled
         """
-        timestamp = int(datetime.utcnow().timestamp())
+        timestamp = int(datetime.now(UTC).timestamp())
         # If upstream_model is empty, use name as the model to send upstream
         model_to_send = upstream_model or name
 
@@ -518,7 +518,7 @@ class FormaDatabase:
         is_enabled: bool = True,
     ) -> bool:
         """Update an existing upstream configuration."""
-        timestamp = int(datetime.utcnow().timestamp())
+        timestamp = int(datetime.now(UTC).timestamp())
         # If upstream_model is empty, use name as the model to send upstream
         model_to_send = upstream_model or name
 
