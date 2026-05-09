@@ -174,7 +174,7 @@ When an agent delegates a task to a subagent, Forma automatically evaluates the 
 1. **Delegation**: Calling agent delegates task to subagent (e.g., @assistant → @researcher)
 2. **Execution**: Subagent executes task with its tools and configuration
 3. **Evaluation**: @evaluator assesses whether task was completed successfully
-4. **Retry Loop**: If incomplete, subagent retries with specific guidance (max 10 attempts)
+4. **Retry Loop**: If incomplete, subagent retries with specific guidance (max 50 attempts)
 5. **Summarization**: @summarizer compacts subagent context before returning to caller
 
 **Evaluation States:**

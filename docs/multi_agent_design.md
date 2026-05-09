@@ -553,7 +553,7 @@ Each agent can use a different upstream model:
 
 - ✅ Add @evaluator and @summarizer meta-agents to config/agents.json
 - ✅ Implement evaluation flow after subagent delegation
-- ✅ Implement retry loop with evaluator guidance (max 10 attempts)
+- ✅ Implement retry loop with evaluator guidance (max 50 attempts)
 - ✅ Implement automatic context compaction at 90% threshold
 - ✅ SSE streaming of evaluation events (__EVAL_EVENT__ markers)
 - ✅ Iterative summarization for large single-message contexts
@@ -572,7 +572,7 @@ Subagent executes (isolated context)
     │
     ├─── complete ──→ @summarizer compacts context ──→ Return to caller
     │
-    ├─── incomplete ──→ Retry with guidance (max 10 attempts)
+    ├─── incomplete ──→ Retry with guidance (max 50 attempts)
     │                      │
     │                      ▼
     │                   @evaluator reassesses
@@ -604,7 +604,7 @@ class EvaluationResult:
    - Previous subagent response
    - Evaluator feedback
 3. Subagent executes again with guidance
-4. Loop continues until complete/failed or max attempts (10)
+4. Loop continues until complete/failed or max attempts (50)
 5. Progressive refinement improves results each iteration
 
 **Context Compaction Strategy:**
@@ -935,7 +935,7 @@ Meta-agents are special agents that manage quality control and context optimizat
     - **Decision**: Automatic evaluation of subagent task completion by @evaluator meta-agent
     - **Implementation**: EvaluationResult with complete/incomplete/failed states, retry loop with guidance
     - **Reason**: Prevents low-quality delegations from polluting calling agent's context
-    - **Retry**: Max 10 attempts with progressive refinement based on evaluator feedback
+    - **Retry**: Max 50 attempts with progressive refinement based on evaluator feedback
     - **Summarization**: @summarizer compacts context before returning to caller
 
 7. **Context overflow in multi-agent**: ✅ RESOLVED - Automatic compaction at 90%

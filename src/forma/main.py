@@ -1448,7 +1448,7 @@ async def _route_to_agents(
     depth: int = 0,
     max_depth: int = 3,
     agent_chain: list[str] | None = None,
-    max_evaluation_retries: int = 10,
+    max_evaluation_retries: int = 50,
 ) -> dict[str, Any]:
     """Route message to mentioned agents sequentially with agent-to-agent support and evaluation.
 
@@ -1727,7 +1727,7 @@ async def _stream_route_to_agents(
     depth: int = 0,
     max_depth: int = 3,
     agent_chain: list[str] | None = None,
-    max_evaluation_retries: int = 10,
+    max_evaluation_retries: int = 50,
 ) -> StreamingResponse:
     """Route message to mentioned agents sequentially with streaming and agent-to-agent support.
 
