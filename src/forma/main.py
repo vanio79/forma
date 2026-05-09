@@ -433,7 +433,7 @@ async def _execute_agent_request(
     Args:
         agent: Agent configuration dict
         messages: Original messages array
-        user_message: The message to send to this agent
+        user_message: The message to send to this agent (extracted from user role)
         original_payload: Original request payload
 
     Returns:
@@ -514,8 +514,34 @@ async def _execute_agent_request(
 
     # Build messages for this agent
     agent_messages = [{"role": "system", "content": system_prompt}]
-    agent_messages.extend(messages[:-1])  # All messages except last
-    agent_messages.append({"role": "user", "content": augmented_user_message})
+
+    # Check if this is a delegation (last message is assistant's response)
+    if messages and messages[-1].get("role") == "assistant":
+        # Delegation case: preserve full conversation history and add continuation prompt
+        agent_messages.extend(messages)  # Include user request + assistant's delegation message
+
+        # Add delegation context to help the agent understand what was requested
+        original_user_request = (
+            _get_user_prompt(messages[:-1]) if len(messages) > 1 else _get_user_prompt(messages)
+        )
+        delegation_msg = messages[-1].get("content", "")
+
+        delegation_context = (
+            f"\n\n--- Delegation Context ---\n"
+            f"Previous agent delegated this request to you.\n"
+            f"Original request: {original_user_request}\n"
+            f"Delegation: {delegation_msg}\n"
+            f"---\n\n"
+            f"Please continue with the delegated task."
+        )
+        agent_messages.append(
+            {"role": "user", "content": augmented_user_message + delegation_context}
+        )
+        logger.info(f"Agent @{agent.get('name')} handling delegation from previous agent")
+    else:
+        # Direct request case: replace last user message with augmented version
+        agent_messages.extend(messages[:-1])  # All messages except last
+        agent_messages.append({"role": "user", "content": augmented_user_message})
 
     # Build payload for agent
     agent_payload = original_payload.copy()
@@ -632,18 +658,19 @@ async def _execute_agent_request_streaming(
 ) -> StreamingResponse:
     """Execute a streaming request for a specific agent with tool execution.
 
-    Similar to _execute_agent_request but with full tool execution loop and streaming.
+    Uses agent's configuration: upstream, instruction prompt, tool settings.
+    Executes tool loop if tools are enabled for the agent and streams tool events.
 
     Args:
         agent: Agent configuration dict
         messages: Original messages array
-        user_message: The message to send to this agent
+        user_message: The message to send to this agent (extracted from user role)
         original_payload: Original request payload
 
     Returns:
-        StreamingResponse from upstream with tool execution events
+        StreamingResponse from upstream (after tool execution if applicable)
     """
-    from forma.tools.executor import ToolExecutor, ToolExecutionEvent
+    from forma.tools.executor import ToolExecutor
 
     settings = get_settings()
 
@@ -672,6 +699,7 @@ async def _execute_agent_request_streaming(
         max_distance = rag_config.get("max_distance", 0.7)
 
         # Simple query extraction from user message
+        # For more sophisticated extraction, could use extractor here
         entities_queries = []
         fact_query = user_message
         recipe_query = user_message
@@ -717,8 +745,34 @@ async def _execute_agent_request_streaming(
 
     # Build messages for this agent
     agent_messages = [{"role": "system", "content": system_prompt}]
-    agent_messages.extend(messages[:-1])  # All messages except last
-    agent_messages.append({"role": "user", "content": augmented_user_message})
+
+    # Check if this is a delegation (last message is assistant's response)
+    if messages and messages[-1].get("role") == "assistant":
+        # Delegation case: preserve full conversation history and add continuation prompt
+        agent_messages.extend(messages)  # Include user request + assistant's delegation message
+
+        # Add delegation context to help the agent understand what was requested
+        original_user_request = (
+            _get_user_prompt(messages[:-1]) if len(messages) > 1 else _get_user_prompt(messages)
+        )
+        delegation_msg = messages[-1].get("content", "")
+
+        delegation_context = (
+            f"\n\n--- Delegation Context ---\n"
+            f"Previous agent delegated this request to you.\n"
+            f"Original request: {original_user_request}\n"
+            f"Delegation: {delegation_msg}\n"
+            f"---\n\n"
+            f"Please continue with the delegated task."
+        )
+        agent_messages.append(
+            {"role": "user", "content": augmented_user_message + delegation_context}
+        )
+        logger.info(f"Agent @{agent.get('name')} handling delegation from previous agent")
+    else:
+        # Direct request case: replace last user message with augmented version
+        agent_messages.extend(messages[:-1])  # All messages except last
+        agent_messages.append({"role": "user", "content": augmented_user_message})
 
     # Build payload for agent
     agent_payload = original_payload.copy()
@@ -945,14 +999,14 @@ async def _route_to_agents(
 
         logger.info(f"Routing to agent @{agent_name} (depth={depth}, chain={current_chain})")
 
-        # Get the last user message to route
-        last_user_msg = messages[-1].get("content", "") if messages else ""
+        # Get the actual user message for RAG query (not the last message which might be assistant)
+        actual_user_msg = _get_user_prompt(messages)
 
         # Execute agent request (non-streaming)
         response = await _execute_agent_request(
             agent=agent,
             messages=messages,
-            user_message=last_user_msg,
+            user_message=actual_user_msg,
             original_payload=original_payload,
         )
 
@@ -1109,14 +1163,14 @@ async def _stream_route_to_agents(
             start_marker = f'__AGENT_START__{{"agent": "{agent_name}", "depth": {depth}, "chain": {chain_json}}}__END__\n'
             yield start_marker.encode()
 
-            # Get the last user message to route
-            last_user_msg = messages[-1].get("content", "") if messages else ""
+            # Get the actual user message for RAG query (not the last message which might be assistant)
+            actual_user_msg = _get_user_prompt(messages)
 
             # Execute agent request (streaming)
             response = await _execute_agent_request_streaming(
                 agent=agent,
                 messages=messages,
-                user_message=last_user_msg,
+                user_message=actual_user_msg,
                 original_payload=original_payload,
             )
 
