@@ -15,15 +15,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from forma.api import router as ui_router
-from forma.config import get_settings
-from forma.extractor import Extractor
-from forma.proxy import OpenAIProxy
-from forma.storage import Storage
-from forma.forma_db import FormaDatabase, get_db
-from forma.upstream_manager import UpstreamManager
-from forma.tools import ToolExecutor, get_registry
-from forma.tools.executor import ToolExecutionEvent
 from forma.agents import (
     AgentRegistry,
     AgentRouter,
@@ -32,6 +23,24 @@ from forma.agents import (
     get_agent_tools_config,
     load_agents_from_config,
 )
+from forma.agents.meta_evaluation import (
+    EvaluationResult,
+    create_isolated_context,
+    create_retry_context,
+    extract_summary,
+    format_evaluator_input,
+    format_summarizer_input,
+    parse_evaluator_response,
+)
+from forma.api import router as ui_router
+from forma.config import get_settings
+from forma.extractor import Extractor
+from forma.forma_db import FormaDatabase
+from forma.proxy import OpenAIProxy
+from forma.storage import Storage
+from forma.tools import ToolExecutor, get_registry
+from forma.tools.executor import ToolExecutionEvent
+from forma.upstream_manager import UpstreamManager
 
 # Configure logging
 logging.basicConfig(
@@ -234,7 +243,7 @@ async def _stream_with_realtime_events(
 
             # Send SSE comment to force flush (comments are ignored by clients)
             # This prevents HTTP buffering from coalescing events
-            yield ": flush\n\n".encode()
+            yield b": flush\n\n"
 
             # Force flush by yielding control to event loop
             # This ensures the SSE chunk is sent immediately, not buffered
@@ -924,6 +933,194 @@ async def _execute_agent_request_streaming(
     )
 
 
+# Meta-agent names (these agents don't get evaluated)
+META_AGENTS = {"evaluator", "summarizer"}
+
+
+def _is_meta_agent(agent_name: str) -> bool:
+    """Check if agent is a meta-agent (internal system agent).
+
+    Meta-agents (evaluator, summarizer) are trusted and don't get
+    evaluated since they're part of the quality control system.
+
+    Args:
+        agent_name: Name of the agent
+
+    Returns:
+        True if agent is a meta-agent
+    """
+    return agent_name in META_AGENTS
+
+
+def _should_evaluate_subagent(
+    calling_agent_name: str,
+    subagent_name: str,
+    depth: int,
+) -> bool:
+    """Determine if subagent's work should be evaluated.
+
+    Args:
+        calling_agent_name: Agent that delegated
+        subagent_name: Agent that was delegated to
+        depth: Current delegation depth
+
+    Returns:
+        True if evaluation should occur
+    """
+    # Don't evaluate meta-agents
+    if _is_meta_agent(subagent_name):
+        return False
+
+    # Don't evaluate if calling agent is meta-agent (they're trusted)
+    if _is_meta_agent(calling_agent_name):
+        return False
+
+    # Don't evaluate at depth 0 (direct user request, not delegation)
+    return depth != 0
+
+
+async def _evaluate_subagent_response(
+    task_description: str,
+    subagent_name: str,
+    subagent_response: str,
+    calling_agent_name: str,
+    original_payload: dict[str, Any],
+) -> EvaluationResult:
+    """Call evaluator agent to assess subagent's work.
+
+    Args:
+        task_description: What the subagent was asked to do
+        subagent_name: Name of the subagent
+        subagent_response: The subagent's output
+        calling_agent_name: Name of agent that delegated
+        original_payload: Original request payload
+
+    Returns:
+        EvaluationResult with status and instructions
+    """
+    if not agent_registry:
+        return EvaluationResult(
+            status="failed",
+            reason="Agent registry not available",
+            is_valid=False,
+        )
+
+    evaluator_agent = agent_registry.get_agent_by_name("evaluator")
+    if not evaluator_agent or not evaluator_agent.get("is_enabled"):
+        logger.warning("Evaluator agent not available, assuming task complete")
+        return EvaluationResult(
+            status="complete",
+            reason="Evaluator unavailable, assuming success",
+            confidence=0.5,
+        )
+
+    # Format input for evaluator
+    evaluator_prompt = format_evaluator_input(
+        task_description=task_description,
+        subagent_name=subagent_name,
+        subagent_response=subagent_response,
+    )
+
+    # Create messages for evaluator
+    evaluator_messages = [{"role": "user", "content": evaluator_prompt}]
+
+    logger.info(f"Calling evaluator to assess @{subagent_name}'s work")
+
+    try:
+        # Execute evaluator (non-streaming, no tools)
+        evaluator_response = await _execute_agent_request(
+            agent=evaluator_agent,
+            messages=evaluator_messages,
+            user_message=evaluator_prompt,
+            original_payload=original_payload,
+        )
+
+        evaluator_content = _get_agent_response(evaluator_response)
+
+        # Parse evaluator's JSON output
+        evaluation = parse_evaluator_response(evaluator_content)
+
+        logger.info(
+            f"Evaluator assessment: status={evaluation.status}, "
+            f"confidence={evaluation.confidence}, reason={evaluation.reason[:50]}"
+        )
+
+        return evaluation
+
+    except Exception as e:
+        logger.error(f"Evaluator execution failed: {e}")
+        return EvaluationResult(
+            status="failed",
+            reason=f"Evaluator error: {e}",
+            is_valid=False,
+        )
+
+
+async def _summarize_subagent_work(
+    task_description: str,
+    subagent_name: str,
+    full_context: str,
+    evaluation: EvaluationResult,
+    original_payload: dict[str, Any],
+) -> str:
+    """Call summarizer agent to compact subagent's work.
+
+    Args:
+        task_description: What the task was
+        subagent_name: Name of subagent
+        full_context: Full context from subagent execution
+        evaluation: Evaluator's assessment
+        original_payload: Original request payload
+
+    Returns:
+        Concise summary for calling agent
+    """
+    if not agent_registry:
+        return f"Summary: @{subagent_name} completed task (registry unavailable)"
+
+    summarizer_agent = agent_registry.get_agent_by_name("summarizer")
+    if not summarizer_agent or not summarizer_agent.get("is_enabled"):
+        logger.warning("Summarizer agent not available, using raw response")
+        # Fallback: truncate the response
+        return extract_summary(full_context[:500])
+
+    # Format input for summarizer
+    summarizer_prompt = format_summarizer_input(
+        task_description=task_description,
+        subagent_name=subagent_name,
+        full_context=full_context,
+        evaluator_assessment=evaluation,
+    )
+
+    # Create messages for summarizer
+    summarizer_messages = [{"role": "user", "content": summarizer_prompt}]
+
+    logger.info(f"Calling summarizer to compact @{subagent_name}'s work")
+
+    try:
+        # Execute summarizer (non-streaming, no tools)
+        summarizer_response = await _execute_agent_request(
+            agent=summarizer_agent,
+            messages=summarizer_messages,
+            user_message=summarizer_prompt,
+            original_payload=original_payload,
+        )
+
+        summarizer_content = _get_agent_response(summarizer_response)
+
+        # Extract clean summary
+        summary = extract_summary(summarizer_content)
+
+        logger.info(f"Summarizer output: {summary[:100]}...")
+
+        return summary
+
+    except Exception as e:
+        logger.error(f"Summarizer execution failed: {e}")
+        # Fallback: use truncated context
+        return f"Summary: @{subagent_name} worked on task (error: {e})"
+
+
 def _check_response_for_mentions(response_content: str) -> list[str]:
     """Check agent response for mentions of other agents.
 
@@ -954,12 +1151,16 @@ async def _route_to_agents(
     depth: int = 0,
     max_depth: int = 3,
     agent_chain: list[str] | None = None,
+    max_evaluation_retries: int = 2,
 ) -> dict[str, Any]:
-    """Route message to mentioned agents sequentially with agent-to-agent support.
+    """Route message to mentioned agents sequentially with agent-to-agent support and evaluation.
 
     Each agent executes one after another. After each agent completes, checks
     for mentions of other agents. If mentions found and depth < max_depth,
     recursively routes to those agents.
+
+    For subagents (depth > 0), evaluates task completion and optionally retries
+    with evaluator guidance. Summarizes results to prevent context pollution.
 
     Args:
         routing_info: Dict with 'agents' (list of agent configs) and 'routing_type'
@@ -968,18 +1169,21 @@ async def _route_to_agents(
         depth: Current recursion depth (for agent-to-agent)
         max_depth: Maximum recursion depth to prevent infinite loops
         agent_chain: List of agent names showing delegation chain (e.g., ["assistant", "researcher"])
+        max_evaluation_retries: Maximum retries when evaluator says task incomplete
 
     Returns:
         Combined response dict with all agent results
     """
     agents = routing_info.get("agents", [])
-    routing_type = routing_info.get("routing_type", "mention")
 
     # Initialize agent chain if not provided
     if agent_chain is None:
         agent_chain = []
 
     results: list[dict[str, Any]] = []
+
+    # Determine calling agent for evaluation context
+    calling_agent_name = agent_chain[-1] if agent_chain else "user"
 
     for agent in agents:
         agent_name = agent.get("name", "unknown")
@@ -989,22 +1193,88 @@ async def _route_to_agents(
 
         logger.info(f"Routing to agent @{agent_name} (depth={depth}, chain={current_chain})")
 
-        # Get the actual user message for RAG query (not the last message which might be assistant)
-        actual_user_msg = _get_user_prompt(messages)
+        # Determine if this is a subagent delegation (depth > 0)
+        is_subagent_delegation = depth > 0
 
-        # Execute agent request (non-streaming)
-        response = await _execute_agent_request(
-            agent=agent,
-            messages=messages,
-            user_message=actual_user_msg,
-            original_payload=original_payload,
-        )
+        # Get task description for evaluation
+        task_description = _get_user_prompt(messages)
 
-        # Extract response content
-        response_content = _get_agent_response(response)
+        # For subagents, use isolated context to prevent pollution
+        if is_subagent_delegation:
+            # Create isolated context with just the delegation message
+            isolated_messages = create_isolated_context(
+                original_task=task_description,
+                calling_agent_name=calling_agent_name,
+                delegation_message=messages[-1].get("content", "") if messages else "",
+            )
+            execution_messages = isolated_messages
+            logger.info(f"Using isolated context for subagent @{agent_name}")
+        else:
+            execution_messages = messages
 
-        # Check for agent-to-agent mentions
-        mentioned_agents = _check_response_for_mentions(response_content)
+        # Execute agent with retry loop for evaluation
+        final_response_content = ""
+        evaluation_attempts = 0
+        evaluation_result = None
+
+        while True:
+            # Get the actual user message for RAG query
+            actual_user_msg = _get_user_prompt(execution_messages)
+
+            # Execute agent request (non-streaming)
+            response = await _execute_agent_request(
+                agent=agent,
+                messages=execution_messages,
+                user_message=actual_user_msg,
+                original_payload=original_payload,
+            )
+
+            # Extract response content
+            response_content = _get_agent_response(response)
+
+            # Check if we should evaluate this subagent's work
+            should_eval = _should_evaluate_subagent(
+                calling_agent_name=calling_agent_name,
+                subagent_name=agent_name,
+                depth=depth,
+            )
+
+            if should_eval and evaluation_attempts < max_evaluation_retries:
+                # Evaluate the response
+                evaluation_result = await _evaluate_subagent_response(
+                    task_description=task_description,
+                    subagent_name=agent_name,
+                    subagent_response=response_content,
+                    calling_agent_name=calling_agent_name,
+                    original_payload=original_payload,
+                )
+
+                if (
+                    evaluation_result.status == "incomplete"
+                    and evaluation_result.retry_instructions
+                ):
+                    # Retry with evaluator guidance
+                    evaluation_attempts += 1
+                    logger.info(
+                        f"Evaluator says @{agent_name} incomplete (attempt {evaluation_attempts}), "
+                        f"retrying with guidance"
+                    )
+
+                    # Create retry context with evaluator instructions
+                    execution_messages = create_retry_context(
+                        original_task=task_description,
+                        previous_response=response_content,
+                        evaluator_instructions=evaluation_result.retry_instructions,
+                        attempt_number=evaluation_attempts,
+                    )
+                    continue  # Retry loop
+
+            # Either no evaluation needed, or evaluation complete, or max retries reached
+            final_response_content = response_content
+            break  # Exit retry loop
+
+        # After execution (with or without evaluation), check for agent-to-agent mentions
+        mentioned_agents = _check_response_for_mentions(final_response_content)
 
         if mentioned_agents and depth < max_depth:
             logger.info(
@@ -1027,9 +1297,31 @@ async def _route_to_agents(
                     sub_agents.append(mentioned_agent)
 
             if sub_agents:
+                # Build routing info for sub-agents (fix bug: was missing)
+                sub_routing_info = {
+                    "agents": sub_agents,
+                    "routing_type": "mention",
+                }
+
                 # Create sub-messages with the agent's response as context
+                # For subagent delegations, use summary if available, otherwise use response
+                content_for_next_agent = final_response_content
+                if is_subagent_delegation and evaluation_result:
+                    # Summarize the work before passing to next agent
+                    summary = await _summarize_subagent_work(
+                        task_description=task_description,
+                        subagent_name=agent_name,
+                        full_context=response_content,  # Use the actual response as context
+                        evaluation=evaluation_result,
+                        original_payload=original_payload,
+                    )
+                    content_for_next_agent = summary
+                    logger.info(
+                        f"Summarized @{agent_name}'s work for downstream: {summary[:100]}..."
+                    )
+
                 sub_messages = messages.copy()
-                sub_messages.append({"role": "assistant", "content": response_content})
+                sub_messages.append({"role": "assistant", "content": content_for_next_agent})
 
                 # Recursively route to mentioned agents with updated chain
                 sub_response = await _route_to_agents(
@@ -1039,28 +1331,58 @@ async def _route_to_agents(
                     depth=depth + 1,
                     max_depth=max_depth,
                     agent_chain=current_chain,  # Pass the current chain to sub-agents
+                    max_evaluation_retries=max_evaluation_retries,
                 )
 
                 # Combine results
                 results.append(
                     {
                         "agent": agent,
-                        "content": response_content,
+                        "content": final_response_content,
+                        "evaluation": evaluation_result,
                         "sub_agents": sub_response.get("results", []),
                     }
                 )
             else:
+                # No sub_agents found, just record result
+                # For subagent delegations, summarize before returning
+                content_to_return = final_response_content
+                if is_subagent_delegation and evaluation_result:
+                    content_to_return = await _summarize_subagent_work(
+                        task_description=task_description,
+                        subagent_name=agent_name,
+                        full_context=response_content,
+                        evaluation=evaluation_result,
+                        original_payload=original_payload,
+                    )
+                    logger.info(f"Summarized @{agent_name}'s work: {content_to_return[:100]}...")
+
                 results.append(
                     {
                         "agent": agent,
-                        "content": response_content,
+                        "content": content_to_return,
+                        "evaluation": evaluation_result,
                     }
                 )
         else:
+            # No mentions or max depth reached
+            # For subagent delegations, summarize before returning
+            content_to_return = final_response_content
+            if is_subagent_delegation and evaluation_result:
+                content_to_return = await _summarize_subagent_work(
+                    task_description=task_description,
+                    subagent_name=agent_name,
+                    full_context=response_content,
+                    evaluation=evaluation_result,
+                    original_payload=original_payload,
+                )
+                logger.info(f"Summarized @{agent_name}'s work: {content_to_return[:100]}...")
+
             results.append(
                 {
                     "agent": agent,
-                    "content": response_content,
+                    "content": content_to_return,
+                    "evaluation": evaluation_result,
                 }
             )
 
@@ -1108,6 +1430,7 @@ async def _stream_route_to_agents(
     depth: int = 0,
     max_depth: int = 3,
     agent_chain: list[str] | None = None,
+    max_evaluation_retries: int = 2,
 ) -> StreamingResponse:
     """Route message to mentioned agents sequentially with streaming and agent-to-agent support.
 
@@ -1116,8 +1439,15 @@ async def _stream_route_to_agents(
     [streaming content]
     __AGENT_END__{"agent": "name", "depth": N, "chain": ["agent1", "agent2"]}__END__
 
+    For subagents (depth > 0), after streaming completes:
+    __EVALUATION__{"status": "...", "reason": "..."}__END__
+    __SUMMARY__{"content": "..."}__END__
+
     After each agent completes, checks for mentions of other agents.
     If mentions found and depth < max_depth, recursively streams sub-agent responses.
+
+    Note: Streaming doesn support retry loop. Evaluation happens after stream ends.
+    If evaluator says incomplete, a marker is sent but retry happens on next request.
 
     Args:
         routing_info: Dict with 'agents' (list of agent configs) and 'routing_type'
@@ -1126,20 +1456,24 @@ async def _stream_route_to_agents(
         depth: Current recursion depth (for agent-to-agent)
         max_depth: Maximum recursion depth to prevent infinite loops
         agent_chain: List of agent names showing delegation chain (e.g., ["assistant", "researcher"])
+        max_evaluation_retries: Maximum retries for evaluation (used for non-streaming fallback)
 
     Returns:
         StreamingResponse with agent markers and content
     """
     agents = routing_info.get("agents", [])
-    routing_type = routing_info.get("routing_type", "mention")
 
     # Initialize agent chain if not provided
     if agent_chain is None:
         agent_chain = []
 
+    # Determine calling agent for evaluation context
+    calling_agent_name = agent_chain[-1] if agent_chain else "user"
+
     async def stream_generator():
         """Generate streaming response with agent markers."""
-        streamed_content_for_mention_check = ""
+        # We need to track content for each agent separately for evaluation
+        agent_streams_data: dict[str, str] = {}
 
         for agent in agents:
             agent_name = agent.get("name", "unknown")
@@ -1153,18 +1487,37 @@ async def _stream_route_to_agents(
             start_marker = f'__AGENT_START__{{"agent": "{agent_name}", "depth": {depth}, "chain": {chain_json}}}__END__\n'
             yield start_marker.encode()
 
-            # Get the actual user message for RAG query (not the last message which might be assistant)
-            actual_user_msg = _get_user_prompt(messages)
+            # Determine if this is a subagent delegation
+            is_subagent_delegation = depth > 0
+
+            # Get task description for evaluation
+            task_description = _get_user_prompt(messages)
+
+            # For subagents, use isolated context
+            if is_subagent_delegation:
+                isolated_messages = create_isolated_context(
+                    original_task=task_description,
+                    calling_agent_name=calling_agent_name,
+                    delegation_message=messages[-1].get("content", "") if messages else "",
+                )
+                execution_messages = isolated_messages
+                logger.info(f"Using isolated context for subagent @{agent_name} (streaming)")
+            else:
+                execution_messages = messages
+
+            # Get the actual user message for RAG query
+            actual_user_msg = _get_user_prompt(execution_messages)
 
             # Execute agent request (streaming)
             response = await _execute_agent_request_streaming(
                 agent=agent,
-                messages=messages,
+                messages=execution_messages,
                 user_message=actual_user_msg,
                 original_payload=original_payload,
             )
 
-            # Stream the agent's response
+            # Stream the agent's response and collect content
+            streamed_content = ""
             if isinstance(response, StreamingResponse):
                 async for chunk in response.body_iterator:
                     # Skip [DONE] markers - we'll send our own at the end
@@ -1173,7 +1526,7 @@ async def _stream_route_to_agents(
                         if chunk_str.strip() == "data: [DONE]\n" or "data: [DONE]" in chunk_str:
                             continue  # Skip [DONE] markers from agent streams
 
-                    # Collect content for mention checking
+                    # Collect content for evaluation and mention checking
                     if isinstance(chunk, bytes):
                         chunk_str = chunk.decode("utf-8")
                         # Extract content from SSE chunks
@@ -1188,10 +1541,66 @@ async def _stream_route_to_agents(
                                         delta = choice.get("delta", {})
                                         content = delta.get("content", "")
                                         if content:
-                                            streamed_content_for_mention_check += content
+                                            streamed_content += content
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             pass
                     yield chunk
+
+            # Store streamed content for this agent
+            agent_streams_data[agent_name] = streamed_content
+
+            # For subagent delegations, evaluate and summarize after stream ends
+            if is_subagent_delegation:
+                should_eval = _should_evaluate_subagent(
+                    calling_agent_name=calling_agent_name,
+                    subagent_name=agent_name,
+                    depth=depth,
+                )
+
+                if should_eval:
+                    # Evaluate the streamed response
+                    evaluation_result = await _evaluate_subagent_response(
+                        task_description=task_description,
+                        subagent_name=agent_name,
+                        subagent_response=streamed_content,
+                        calling_agent_name=calling_agent_name,
+                        original_payload=original_payload,
+                    )
+
+                    # Send evaluation marker
+                    eval_marker_data = {
+                        "status": evaluation_result.status,
+                        "reason": evaluation_result.reason,
+                        "confidence": evaluation_result.confidence,
+                    }
+                    if evaluation_result.retry_instructions:
+                        eval_marker_data["retry_instructions"] = (
+                            evaluation_result.retry_instructions
+                        )
+
+                    eval_marker = f"__EVALUATION__{json.dumps(eval_marker_data)}__END__\n"
+                    yield eval_marker.encode()
+
+                    # Log if incomplete (retry not supported in streaming)
+                    if evaluation_result.status == "incomplete":
+                        logger.warning(
+                            f"Evaluator says @{agent_name} incomplete in streaming mode, "
+                            f"retry not supported - sending marker only"
+                        )
+
+                    # Summarize and send summary marker
+                    summary = await _summarize_subagent_work(
+                        task_description=task_description,
+                        subagent_name=agent_name,
+                        full_context=streamed_content,
+                        evaluation=evaluation_result,
+                        original_payload=original_payload,
+                    )
+
+                    summary_marker = f"__SUMMARY__{json.dumps({'content': summary})}__END__\n"
+                    yield summary_marker.encode()
+
+                    logger.info(f"Sent evaluation and summary markers for @{agent_name}")
 
             # Send agent end marker with chain
             chain_json = json.dumps(current_chain)
@@ -1199,7 +1608,7 @@ async def _stream_route_to_agents(
             yield end_marker.encode()
 
             # Check for agent-to-agent mentions in the streamed content
-            mentioned_agents = _check_response_for_mentions(streamed_content_for_mention_check)
+            mentioned_agents = _check_response_for_mentions(streamed_content)
 
             if mentioned_agents and depth < max_depth:
                 logger.info(
@@ -1222,11 +1631,18 @@ async def _stream_route_to_agents(
                         sub_agents.append(mentioned_agent)
 
                 if sub_agents:
+                    # For subagent delegations, use summary if available
+                    content_for_next_agent = streamed_content
+                    if is_subagent_delegation:
+                        # Get the summary we just sent
+                        # The summary should be used for the next agent's context
+                        # But in streaming, we already sent the full content
+                        # For now, pass the full content (streaming limitation)
+                        pass
+
                     # Create sub-messages with the agent's response as context
                     sub_messages = messages.copy()
-                    sub_messages.append(
-                        {"role": "assistant", "content": streamed_content_for_mention_check}
-                    )
+                    sub_messages.append({"role": "assistant", "content": content_for_next_agent})
 
                     # Build routing info for mentioned agents
                     sub_routing_info = {
@@ -1242,6 +1658,7 @@ async def _stream_route_to_agents(
                         depth=depth + 1,
                         max_depth=max_depth,
                         agent_chain=current_chain,  # Pass the current chain to sub-agents
+                        max_evaluation_retries=max_evaluation_retries,
                     )
 
                     # Stream sub-agent responses
@@ -1259,7 +1676,7 @@ async def _stream_route_to_agents(
 
         # Send final [DONE] marker only at depth 0
         if depth == 0:
-            yield "data: [DONE]\n\n".encode()
+            yield b"data: [DONE]\n\n"
 
     # Return streaming response with headers to disable buffering
     return StreamingResponse(
@@ -1594,7 +2011,7 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
                                     if message.get("role"):
                                         choice["delta"]["role"] = message.get("role")
                         yield f"data: {json.dumps(sse_response)}\n\n".encode()
-                        yield "data: [DONE]\n\n".encode()
+                        yield b"data: [DONE]\n\n"
 
                 # Store extraction data in background
                 relationships = extraction_result.relationships if extraction_result else []
@@ -1661,7 +2078,7 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
                 return await proxy.chat_completions(forward_payload)
 
             # Execute tool loop
-            logger.info(f"Executing tool loop (streaming=False)")
+            logger.info("Executing tool loop (streaming=False)")
             tool_result = await tool_executor.execute_loop(
                 messages=messages,
                 tools=tools,

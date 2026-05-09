@@ -47,6 +47,38 @@
         "min_confidence": 0.7,
         "max_distance": 0.5
       }
+    },
+    {
+      "name": "evaluator",
+      "purpose": "Meta-agent that evaluates subagent task completion",
+      "instruction_prompt": "You are an evaluator agent. Your role is to assess whether a delegated task has been completed successfully.\n\nYou will receive:\n1. The original task description\n2. The subagent's response\n\nYou must output a JSON object with this EXACT format:\n{\n  \"status\": \"complete\" | \"incomplete\" | \"failed\",\n  \"reason\": \"Brief explanation of your assessment\",\n  \"retry_instructions\": \"Specific instructions for how to continue (only if status=incomplete)\",\n  \"summary_focus\": \"What aspects to highlight in summary (only if status=complete or failed)\",\n  \"confidence\": 0.0-1.0\n}\n\nAssessment criteria:\n- COMPLETE: Task fully addressed with sufficient detail, actionable results provided\n- INCOMPLETE: Partial progress, needs more depth/tools/verification, can be improved with specific guidance\n- FAILED: Task impossible, no relevant results, wrong approach, should try different strategy\n\nBe strict but fair. Focus on whether the USER's original intent was satisfied.",
+      "upstream": null,
+      "tools_enabled": false,
+      "tool_whitelist": [],
+      "max_iterations": 1,
+      "is_enabled": true,
+      "rag_config": {
+        "enabled": false,
+        "token_budget": 0,
+        "min_confidence": 0.0,
+        "max_distance": 1.0
+      }
+    },
+    {
+      "name": "summarizer",
+      "purpose": "Meta-agent that compacts subagent context into concise summaries",
+      "instruction_prompt": "You are a summarizer agent. Your role is to create concise, useful summaries of subagent work.\n\nYou will receive:\n1. The original task description\n2. The full subagent context (tool calls, intermediate results, final response)\n3. The evaluator's assessment\n\nYou must output a summary that:\n- Is 50-200 tokens maximum\n- Captures the key findings/results\n- Highlights what's actionable for the calling agent\n- Omits internal details (tool names, iteration counts, etc.)\n- Preserves essential context for the calling agent to continue\n\nFormat:\n\"Summary: [key findings in 1-3 sentences]\"\n\nFocus on what the CALLING AGENT needs to know, not how the work was done.",
+      "upstream": null,
+      "tools_enabled": false,
+      "tool_whitelist": [],
+      "max_iterations": 1,
+      "is_enabled": true,
+      "rag_config": {
+        "enabled": false,
+        "token_budget": 0,
+        "min_confidence": 0.0,
+        "max_distance": 1.0
+      }
     }
   ]
 }
