@@ -521,18 +521,13 @@ async def _execute_agent_request(
         agent_messages.extend(messages)  # Include user request + assistant's delegation message
 
         # Add delegation context to help the agent understand what was requested
-        original_user_request = (
-            _get_user_prompt(messages[:-1]) if len(messages) > 1 else _get_user_prompt(messages)
-        )
         delegation_msg = messages[-1].get("content", "")
 
         delegation_context = (
             f"\n\n--- Delegation Context ---\n"
-            f"Previous agent delegated this request to you.\n"
-            f"Original request: {original_user_request}\n"
-            f"Delegation: {delegation_msg}\n"
+            f'Previous agent delegated: "{delegation_msg}"\n'
             f"---\n\n"
-            f"Please continue with the delegated task."
+            f"Continue with this task using your specialized capabilities."
         )
         agent_messages.append(
             {"role": "user", "content": augmented_user_message + delegation_context}
@@ -752,18 +747,13 @@ async def _execute_agent_request_streaming(
         agent_messages.extend(messages)  # Include user request + assistant's delegation message
 
         # Add delegation context to help the agent understand what was requested
-        original_user_request = (
-            _get_user_prompt(messages[:-1]) if len(messages) > 1 else _get_user_prompt(messages)
-        )
         delegation_msg = messages[-1].get("content", "")
 
         delegation_context = (
             f"\n\n--- Delegation Context ---\n"
-            f"Previous agent delegated this request to you.\n"
-            f"Original request: {original_user_request}\n"
-            f"Delegation: {delegation_msg}\n"
+            f'Previous agent delegated: "{delegation_msg}"\n'
             f"---\n\n"
-            f"Please continue with the delegated task."
+            f"Continue with this task using your specialized capabilities."
         )
         agent_messages.append(
             {"role": "user", "content": augmented_user_message + delegation_context}
