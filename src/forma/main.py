@@ -25,12 +25,15 @@ from forma.agents import (
 )
 from forma.agents.meta_evaluation import (
     EvaluationResult,
+    build_compaction_input,
     create_isolated_context,
     create_retry_context,
+    estimate_messages_tokens,
     extract_summary,
     format_evaluator_input,
     format_summarizer_input,
     parse_evaluator_response,
+    should_compact_context,
 )
 from forma.api import router as ui_router
 from forma.config import get_settings
@@ -547,6 +550,23 @@ async def _execute_agent_request(
         agent_messages.extend(messages[:-1])  # All messages except last
         agent_messages.append({"role": "user", "content": augmented_user_message})
 
+    # Auto-compact context if needed (prevent overflow during agent chains)
+    # This happens before agent execution, not after
+    # All agents (including meta-agents) now receive full history and rely on automatic compaction
+    settings_compact = get_settings()
+    if should_compact_context(
+        agent_messages,
+        settings_compact.context_window_size,
+        settings_compact.context_compaction_threshold,
+        settings_compact.context_chars_per_token,
+    ):
+        logger.info(f"Auto-compacting context before agent @{agent.get('name')} execution")
+        agent_messages = await _compact_conversation_context(
+            messages=agent_messages,
+            original_payload=original_payload,
+            keep_recent=settings_compact.context_keep_recent_messages,
+        )
+
     # Build payload for agent
     agent_payload = original_payload.copy()
 
@@ -773,6 +793,23 @@ async def _execute_agent_request_streaming(
         agent_messages.extend(messages[:-1])  # All messages except last
         agent_messages.append({"role": "user", "content": augmented_user_message})
 
+    # Auto-compact context if needed (prevent overflow during agent chains)
+    # This happens before agent execution, not after
+    # All agents (including meta-agents) now receive full history and rely on automatic compaction
+    settings_compact = get_settings()
+    if should_compact_context(
+        agent_messages,
+        settings_compact.context_window_size,
+        settings_compact.context_compaction_threshold,
+        settings_compact.context_chars_per_token,
+    ):
+        logger.info(f"Auto-compacting context before agent @{agent.get('name')} execution")
+        agent_messages = await _compact_conversation_context(
+            messages=agent_messages,
+            original_payload=original_payload,
+            keep_recent=settings_compact.context_keep_recent_messages,
+        )
+
     # Build payload for agent
     agent_payload = original_payload.copy()
 
@@ -952,6 +989,263 @@ def _is_meta_agent(agent_name: str) -> bool:
     return agent_name in META_AGENTS
 
 
+async def _compact_conversation_context(
+    messages: list[dict[str, Any]],
+    original_payload: dict[str, Any],
+    keep_recent: int = 4,
+) -> list[dict[str, Any]]:
+    """Compact conversation context using @summarizer agent.
+
+    Replaces older messages with a summary to prevent context overflow
+    during multi-agent conversations.
+
+    Args:
+        messages: Current conversation messages
+        original_payload: Original request payload
+        keep_recent: Number of recent messages to keep (default: 4 = 2 exchanges)
+
+    Returns:
+        Compacted messages array with summary replacing old messages
+    """
+    from forma.agents.meta_evaluation import (
+        build_compaction_input,
+        estimate_messages_tokens,
+        extract_summary,
+        should_compact_context,
+    )
+
+    settings = get_settings()
+
+    # Check if compaction is needed
+    context_window = settings.context_window_size
+    threshold = settings.context_compaction_threshold
+    chars_per_token = settings.context_chars_per_token
+
+    if not should_compact_context(messages, context_window, threshold, chars_per_token):
+        return messages  # No compaction needed
+
+    # Calculate current token count and threshold
+    old_tokens = estimate_messages_tokens(messages, chars_per_token)
+    threshold_tokens = int(context_window * threshold)
+
+    logger.info(
+        f"Context compaction needed: {old_tokens} tokens "
+        f"(threshold: {threshold_tokens}, window: {context_window})"
+    )
+
+    # Ensure we have enough messages to compact
+    if len(messages) <= keep_recent:
+        # Can't compact by removing messages, but we can iteratively summarize large content
+        logger.warning(
+            f"Context exceeds threshold but only {len(messages)} messages exist. "
+            f"Using iterative summarization to compact large messages."
+        )
+
+        # Get summarizer agent
+        if not agent_registry:
+            logger.warning("Agent registry unavailable, cannot compact context")
+            return messages
+
+        summarizer_agent = agent_registry.get_agent_by_name("summarizer")
+        if not summarizer_agent or not summarizer_agent.get("is_enabled"):
+            logger.warning("Summarizer agent unavailable, cannot compact context")
+            return messages
+
+        # Split messages into chunks that fit within summarizer's context window
+        # Leave room for summarizer prompt and response (~4000 tokens buffer)
+        chunk_target_tokens = int(context_window * 0.7)  # 70% of context for each chunk
+        max_summary_tokens = 2000  # Target summary size
+
+        # Combine all messages into one large text for chunking
+        full_text_parts = []
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                full_text_parts.append(f"{role.upper()}: {content}")
+            elif isinstance(content, list):
+                # Handle multi-modal content
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                if text_parts:
+                    full_text_parts.append(f"{role.upper()}: {' '.join(text_parts)}")
+
+        full_text = "\n\n".join(full_text_parts)
+
+        # Split into chunks based on character estimation
+        chars_per_chunk = chunk_target_tokens * chars_per_token
+        chunks = []
+        current_pos = 0
+
+        while current_pos < len(full_text):
+            chunk_end = min(current_pos + chars_per_chunk, len(full_text))
+            # Try to find a good break point (double newline)
+            if chunk_end < len(full_text):
+                # Look for break point within last 500 chars of chunk
+                search_start = max(chunk_end - 500, current_pos)
+                break_pos = full_text.find("\n\n", search_start, chunk_end + 500)
+                if break_pos > current_pos:
+                    chunk_end = break_pos
+
+            chunks.append(full_text[current_pos:chunk_end])
+            current_pos = chunk_end
+
+        logger.info(
+            f"Split large context ({old_tokens} tokens) into {len(chunks)} chunks "
+            f"for iterative summarization"
+        )
+
+        # Iteratively summarize chunks
+        accumulated_summary = ""
+
+        try:
+            for i, chunk in enumerate(chunks):
+                # Build prompt for this chunk
+                if i == 0:
+                    prompt = (
+                        f"Summarize this conversation segment concisely:\n\n{chunk}\n\n"
+                        f"Provide a summary (target {max_summary_tokens} tokens) capturing "
+                        f"key information, decisions, and context needed for continuing work."
+                    )
+                else:
+                    # Include previous summary + new chunk
+                    prompt = (
+                        f"Previous summary:\n{accumulated_summary}\n\n"
+                        f"New conversation segment:\n{chunk}\n\n"
+                        f"Update and expand the summary to include information from the new segment. "
+                        f"Keep it concise (target {max_summary_tokens} tokens total)."
+                    )
+
+                summarizer_messages = [{"role": "user", "content": prompt}]
+
+                logger.info(f"Summarizing chunk {i + 1}/{len(chunks)} ({len(chunk)} chars)")
+
+                # Execute summarizer
+                summarizer_response = await _execute_agent_request(
+                    agent=summarizer_agent,
+                    messages=summarizer_messages,
+                    user_message=prompt,
+                    original_payload=original_payload,
+                )
+
+                summarizer_content = _get_agent_response(summarizer_response)
+                accumulated_summary = extract_summary(summarizer_content)
+
+                logger.info(f"Chunk {i + 1} summary: {accumulated_summary[:100]}...")
+
+            # Final summary message
+            summary_message = {
+                "role": "system",
+                "content": f"[CONTEXT SUMMARY]\n{accumulated_summary}",
+            }
+
+            # Return just the summary (no original messages since they're compacted)
+            result_messages = [summary_message]
+
+            # Add keep_recent most recent messages if they exist
+            if keep_recent > 0 and len(messages) >= keep_recent:
+                result_messages.extend(messages[-keep_recent:])
+
+            # Calculate reduction
+            new_tokens = estimate_messages_tokens(result_messages, chars_per_token)
+            reduction_pct = (1 - new_tokens / old_tokens) * 100 if old_tokens > 0 else 0
+
+            logger.info(
+                f"Iterative summarization complete: {old_tokens} -> {new_tokens} tokens "
+                f"({reduction_pct:.1f}% reduction)"
+            )
+
+            return result_messages
+
+        except Exception as e:
+            logger.error(f"Iterative summarization failed: {e}")
+            # Fallback: truncate aggressively
+            logger.warning("Falling back to truncation")
+            target_tokens = int(threshold_tokens * 0.6)
+            max_chars = target_tokens * chars_per_token
+
+            truncated_messages = []
+            for msg in messages:
+                truncated_msg = msg.copy()
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > max_chars:
+                    truncated_msg["content"] = content[:max_chars] + "\n[...TRUNCATED...]"
+                truncated_messages.append(truncated_msg)
+
+            return truncated_messages
+
+    # Messages to summarize (everything except recent)
+    messages_to_summarize = messages[:-keep_recent]
+    recent_messages = messages[-keep_recent:]
+
+    logger.info(
+        f"Compacting context: summarizing {len(messages_to_summarize)} messages, "
+        f"keeping {len(recent_messages)} recent"
+    )
+
+    # Get summarizer agent
+    if not agent_registry:
+        logger.warning("Agent registry unavailable, cannot compact context")
+        return messages
+
+    summarizer_agent = agent_registry.get_agent_by_name("summarizer")
+    if not summarizer_agent or not summarizer_agent.get("is_enabled"):
+        logger.warning("Summarizer agent unavailable, cannot compact context")
+        return messages
+
+    # Build compaction prompt
+    compaction_prompt = build_compaction_input(messages_to_summarize)
+
+    # Create messages for summarizer
+    summarizer_messages = [{"role": "user", "content": compaction_prompt}]
+
+    try:
+        # Execute summarizer (non-streaming, no tools)
+        # Pass full payload - automatic compaction will handle context size
+        logger.info("Calling @summarizer for context compaction")
+        summarizer_response = await _execute_agent_request(
+            agent=summarizer_agent,
+            messages=summarizer_messages,
+            user_message=compaction_prompt,
+            original_payload=original_payload,
+        )
+
+        summarizer_content = _get_agent_response(summarizer_response)
+
+        # Extract clean summary
+        summary = extract_summary(summarizer_content)
+
+        logger.info(f"Context compaction summary: {summary[:100]}...")
+
+        # Create summary message
+        summary_message = {
+            "role": "system",
+            "content": f"[CONTEXT SUMMARY]\n{summary}",
+        }
+
+        # Return: summary + recent messages
+        compacted_messages = [summary_message] + recent_messages
+
+        # Log the compaction result
+        old_tokens = estimate_messages_tokens(messages, chars_per_token)
+        new_tokens = estimate_messages_tokens(compacted_messages, chars_per_token)
+        reduction_pct = (1 - new_tokens / old_tokens) * 100 if old_tokens > 0 else 0
+
+        logger.info(
+            f"Context compacted: {old_tokens} -> {new_tokens} tokens "
+            f"({reduction_pct:.1f}% reduction)"
+        )
+
+        return compacted_messages
+
+    except Exception as e:
+        logger.error(f"Context compaction failed: {e}")
+        # Return original messages if compaction fails
+        return messages
+
+
 def _should_evaluate_subagent(
     calling_agent_name: str,
     subagent_name: str,
@@ -993,7 +1287,7 @@ async def _evaluate_subagent_response(
         subagent_name: Name of the subagent
         subagent_response: The subagent's output
         calling_agent_name: Name of agent that delegated
-        original_payload: Original request payload
+        original_payload: Original request payload (full payload for context)
 
     Returns:
         EvaluationResult with status and instructions
@@ -1028,6 +1322,7 @@ async def _evaluate_subagent_response(
 
     try:
         # Execute evaluator (non-streaming, no tools)
+        # Pass full payload - automatic compaction will handle context size
         evaluator_response = await _execute_agent_request(
             agent=evaluator_agent,
             messages=evaluator_messages,
@@ -1070,7 +1365,7 @@ async def _summarize_subagent_work(
         subagent_name: Name of subagent
         full_context: Full context from subagent execution
         evaluation: Evaluator's assessment
-        original_payload: Original request payload
+        original_payload: Original request payload (full payload - summarizer needs full history)
 
     Returns:
         Concise summary for calling agent
@@ -1099,6 +1394,8 @@ async def _summarize_subagent_work(
 
     try:
         # Execute summarizer (non-streaming, no tools)
+        # Pass full payload - summarizer needs full history for proper summarization
+        # Automatic compaction will handle context size
         summarizer_response = await _execute_agent_request(
             agent=summarizer_agent,
             messages=summarizer_messages,
@@ -1151,7 +1448,7 @@ async def _route_to_agents(
     depth: int = 0,
     max_depth: int = 3,
     agent_chain: list[str] | None = None,
-    max_evaluation_retries: int = 2,
+    max_evaluation_retries: int = 10,
 ) -> dict[str, Any]:
     """Route message to mentioned agents sequentially with agent-to-agent support and evaluation.
 
@@ -1430,7 +1727,7 @@ async def _stream_route_to_agents(
     depth: int = 0,
     max_depth: int = 3,
     agent_chain: list[str] | None = None,
-    max_evaluation_retries: int = 2,
+    max_evaluation_retries: int = 10,
 ) -> StreamingResponse:
     """Route message to mentioned agents sequentially with streaming and agent-to-agent support.
 
@@ -1482,125 +1779,282 @@ async def _stream_route_to_agents(
             # Add this agent to the chain
             current_chain = agent_chain + [agent_name]
 
-            # Send agent start marker with chain
-            chain_json = json.dumps(current_chain)
-            start_marker = f'__AGENT_START__{{"agent": "{agent_name}", "depth": {depth}, "chain": {chain_json}}}__END__\n'
-            yield start_marker.encode()
-
             # Determine if this is a subagent delegation
             is_subagent_delegation = depth > 0
 
             # Get task description for evaluation
             task_description = _get_user_prompt(messages)
 
-            # For subagents, use isolated context
-            if is_subagent_delegation:
-                isolated_messages = create_isolated_context(
-                    original_task=task_description,
-                    calling_agent_name=calling_agent_name,
-                    delegation_message=messages[-1].get("content", "") if messages else "",
+            # Retry loop for evaluation
+            evaluation_attempts = 0
+            evaluation_result = None
+            final_streamed_content = ""
+
+            while evaluation_attempts <= max_evaluation_retries:
+                # Send agent start marker with chain (only on first attempt)
+                if evaluation_attempts == 0:
+                    chain_json = json.dumps(current_chain)
+                    start_marker = f'__AGENT_START__{{"agent": "{agent_name}", "depth": {depth}, "chain": {chain_json}}}__END__\n'
+                    yield start_marker.encode()
+
+                # Prepare messages for execution
+                if is_subagent_delegation:
+                    if evaluation_attempts == 0:
+                        # First attempt: use isolated context
+                        isolated_messages = create_isolated_context(
+                            original_task=task_description,
+                            calling_agent_name=calling_agent_name,
+                            delegation_message=messages[-1].get("content", "") if messages else "",
+                        )
+                        execution_messages = isolated_messages
+                        logger.info(
+                            f"Using isolated context for subagent @{agent_name} (streaming)"
+                        )
+                    else:
+                        # Retry: use retry context with evaluator guidance
+                        retry_messages = create_retry_context(
+                            original_task=task_description,
+                            previous_response=streamed_content,
+                            evaluator_instructions=evaluation_result.retry_instructions
+                            if evaluation_result
+                            else "",
+                            attempt_number=evaluation_attempts,
+                        )
+                        execution_messages = retry_messages
+
+                        # Send retry indicator to user
+                        retry_msg = (
+                            f"\n🔄 **Retry attempt {evaluation_attempts}** for @{agent_name}\n"
+                        )
+                        retry_msg += f"Guidance from evaluator: {evaluation_result.retry_instructions if evaluation_result else 'N/A'}\n"
+                        retry_sse = {
+                            "choices": [
+                                {
+                                    "delta": {"role": "assistant", "content": retry_msg},
+                                    "finish_reason": None,
+                                    "index": 0,
+                                }
+                            ]
+                        }
+                        yield f"data: {json.dumps(retry_sse)}\n\n".encode()
+
+                        logger.info(
+                            f"Created retry context (attempt #{evaluation_attempts}) for @{agent_name}"
+                        )
+                else:
+                    execution_messages = messages
+
+                # Get the actual user message for RAG query
+                actual_user_msg = _get_user_prompt(execution_messages)
+
+                # Execute agent request (streaming)
+                response = await _execute_agent_request_streaming(
+                    agent=agent,
+                    messages=execution_messages,
+                    user_message=actual_user_msg,
+                    original_payload=original_payload,
                 )
-                execution_messages = isolated_messages
-                logger.info(f"Using isolated context for subagent @{agent_name} (streaming)")
-            else:
-                execution_messages = messages
 
-            # Get the actual user message for RAG query
-            actual_user_msg = _get_user_prompt(execution_messages)
+                # Stream the agent's response and collect content
+                streamed_content = ""
+                if isinstance(response, StreamingResponse):
+                    async for chunk in response.body_iterator:
+                        # Skip [DONE] markers - we'll send our own at the end
+                        if isinstance(chunk, bytes):
+                            chunk_str = chunk.decode("utf-8")
+                            if chunk_str.strip() == "data: [DONE]\n" or "data: [DONE]" in chunk_str:
+                                continue  # Skip [DONE] markers from agent streams
 
-            # Execute agent request (streaming)
-            response = await _execute_agent_request_streaming(
-                agent=agent,
-                messages=execution_messages,
-                user_message=actual_user_msg,
-                original_payload=original_payload,
-            )
+                        # Collect content for evaluation and mention checking
+                        if isinstance(chunk, bytes):
+                            chunk_str = chunk.decode("utf-8")
+                            # Extract content from SSE chunks
+                            try:
+                                if chunk_str.startswith("data: ") and not chunk_str.startswith(
+                                    "data: [DONE]"
+                                ):
+                                    data_str = chunk_str[6:].strip()
+                                    if data_str:
+                                        chunk_json = json.loads(data_str)
+                                        for choice in chunk_json.get("choices", []):
+                                            delta = choice.get("delta", {})
+                                            content = delta.get("content", "")
+                                            if content:
+                                                streamed_content += content
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                pass
+                        yield chunk
 
-            # Stream the agent's response and collect content
-            streamed_content = ""
-            if isinstance(response, StreamingResponse):
-                async for chunk in response.body_iterator:
-                    # Skip [DONE] markers - we'll send our own at the end
-                    if isinstance(chunk, bytes):
-                        chunk_str = chunk.decode("utf-8")
-                        if chunk_str.strip() == "data: [DONE]\n" or "data: [DONE]" in chunk_str:
-                            continue  # Skip [DONE] markers from agent streams
+                # Store streamed content for this agent
+                final_streamed_content = streamed_content
+                agent_streams_data[agent_name] = streamed_content
 
-                    # Collect content for evaluation and mention checking
-                    if isinstance(chunk, bytes):
-                        chunk_str = chunk.decode("utf-8")
-                        # Extract content from SSE chunks
-                        try:
-                            if chunk_str.startswith("data: ") and not chunk_str.startswith(
-                                "data: [DONE]"
-                            ):
-                                data_str = chunk_str[6:].strip()
-                                if data_str:
-                                    chunk_json = json.loads(data_str)
-                                    for choice in chunk_json.get("choices", []):
-                                        delta = choice.get("delta", {})
-                                        content = delta.get("content", "")
-                                        if content:
-                                            streamed_content += content
-                        except (json.JSONDecodeError, UnicodeDecodeError):
-                            pass
-                    yield chunk
-
-            # Store streamed content for this agent
-            agent_streams_data[agent_name] = streamed_content
-
-            # For subagent delegations, evaluate and summarize after stream ends
-            if is_subagent_delegation:
-                should_eval = _should_evaluate_subagent(
-                    calling_agent_name=calling_agent_name,
-                    subagent_name=agent_name,
-                    depth=depth,
+                # DEBUG: Log stream completion
+                logger.info(
+                    f"DEBUG: Stream completed for @{agent_name}, "
+                    f"streamed_content length: {len(streamed_content)}, "
+                    f"is_subagent_delegation: {is_subagent_delegation}, "
+                    f"depth: {depth}"
                 )
 
-                if should_eval:
-                    # Evaluate the streamed response
-                    evaluation_result = await _evaluate_subagent_response(
-                        task_description=task_description,
-                        subagent_name=agent_name,
-                        subagent_response=streamed_content,
+                # For subagent delegations, evaluate after stream ends
+                if is_subagent_delegation:
+                    should_eval = _should_evaluate_subagent(
                         calling_agent_name=calling_agent_name,
-                        original_payload=original_payload,
-                    )
-
-                    # Send evaluation marker
-                    eval_marker_data = {
-                        "status": evaluation_result.status,
-                        "reason": evaluation_result.reason,
-                        "confidence": evaluation_result.confidence,
-                    }
-                    if evaluation_result.retry_instructions:
-                        eval_marker_data["retry_instructions"] = (
-                            evaluation_result.retry_instructions
-                        )
-
-                    eval_marker = f"__EVALUATION__{json.dumps(eval_marker_data)}__END__\n"
-                    yield eval_marker.encode()
-
-                    # Log if incomplete (retry not supported in streaming)
-                    if evaluation_result.status == "incomplete":
-                        logger.warning(
-                            f"Evaluator says @{agent_name} incomplete in streaming mode, "
-                            f"retry not supported - sending marker only"
-                        )
-
-                    # Summarize and send summary marker
-                    summary = await _summarize_subagent_work(
-                        task_description=task_description,
                         subagent_name=agent_name,
-                        full_context=streamed_content,
-                        evaluation=evaluation_result,
-                        original_payload=original_payload,
+                        depth=depth,
                     )
 
-                    summary_marker = f"__SUMMARY__{json.dumps({'content': summary})}__END__\n"
-                    yield summary_marker.encode()
+                    # DEBUG: Log evaluation decision
+                    logger.info(
+                        f"DEBUG: Evaluation decision for @{agent_name}: "
+                        f"should_eval={should_eval}, "
+                        f"calling_agent={calling_agent_name}, "
+                        f"subagent={agent_name}, "
+                        f"depth={depth}"
+                    )
 
-                    logger.info(f"Sent evaluation and summary markers for @{agent_name}")
+                    if should_eval:
+                        # Evaluate the streamed response
+                        evaluation_result = await _evaluate_subagent_response(
+                            task_description=task_description,
+                            subagent_name=agent_name,
+                            subagent_response=streamed_content,
+                            calling_agent_name=calling_agent_name,
+                            original_payload=original_payload,
+                        )
+
+                        # Send evaluation as visible text in the chat (SSE format)
+                        status_emoji = {"complete": "✅", "incomplete": "⚠️", "failed": "❌"}.get(
+                            evaluation_result.status, "📋"
+                        )
+
+                        eval_visible = f"\n\n---\n**{status_emoji} EVALUATION of @{agent_name}** (attempt {evaluation_attempts + 1})\n"
+                        eval_visible += f"**Status:** {evaluation_result.status} ({int(evaluation_result.confidence * 100)}% confidence)\n"
+                        eval_visible += f"**Reason:** {evaluation_result.reason}\n"
+                        if evaluation_result.retry_instructions:
+                            eval_visible += (
+                                f"**Retry Instructions:** {evaluation_result.retry_instructions}\n"
+                            )
+                        if evaluation_result.summary_focus:
+                            eval_visible += (
+                                f"**Summary Focus:** {evaluation_result.summary_focus}\n"
+                            )
+                        eval_visible += "---\n"
+
+                        # Wrap in SSE format for UI to display
+                        eval_sse = {
+                            "choices": [
+                                {
+                                    "delta": {"role": "assistant", "content": eval_visible},
+                                    "finish_reason": None,
+                                    "index": 0,
+                                }
+                            ]
+                        }
+                        yield f"data: {json.dumps(eval_sse)}\n\n".encode()
+
+                        # Also send the marker for internal processing
+                        eval_marker_data = {
+                            "status": evaluation_result.status,
+                            "reason": evaluation_result.reason,
+                            "confidence": evaluation_result.confidence,
+                        }
+                        if evaluation_result.retry_instructions:
+                            eval_marker_data["retry_instructions"] = (
+                                evaluation_result.retry_instructions
+                            )
+
+                        eval_marker = f"__EVALUATION__{json.dumps(eval_marker_data)}__END__\n"
+                        yield eval_marker.encode()
+
+                        # Log full evaluation details
+                        logger.info(
+                            f"Full evaluation for @{agent_name}: "
+                            f"status={evaluation_result.status}, "
+                            f"confidence={evaluation_result.confidence}, "
+                            f"reason={evaluation_result.reason}"
+                        )
+                        if evaluation_result.retry_instructions:
+                            logger.info(
+                                f"Retry instructions: {evaluation_result.retry_instructions}"
+                            )
+                        if evaluation_result.summary_focus:
+                            logger.info(f"Summary focus: {evaluation_result.summary_focus}")
+
+                        # Check if we should retry
+                        if (
+                            evaluation_result.status == "incomplete"
+                            and evaluation_result.retry_instructions
+                            and evaluation_attempts < max_evaluation_retries
+                        ):
+                            evaluation_attempts += 1
+
+                            # Send retry attempt message to UI immediately
+                            retry_message = f"\n\n🔄 **Retrying @{agent_name}** (attempt {evaluation_attempts}/{max_evaluation_retries})...\n\n"
+                            retry_sse = {
+                                "choices": [
+                                    {
+                                        "delta": {"role": "assistant", "content": retry_message},
+                                        "finish_reason": None,
+                                        "index": 0,
+                                    }
+                                ]
+                            }
+                            yield f"data: {json.dumps(retry_sse)}\n\n".encode()
+
+                            logger.info(
+                                f"Evaluator says @{agent_name} incomplete (attempt {evaluation_attempts}), "
+                                f"retrying with guidance"
+                            )
+
+                            continue  # Retry loop - will re-execute with retry context
+                        else:
+                            # Complete, failed, or max retries reached
+                            # Summarize and break
+                            break
+                    else:
+                        # No evaluation needed
+                        break
+                else:
+                    # Not subagent delegation, no retry
+                    break
+
+            # After retry loop completes, summarize if needed
+            if is_subagent_delegation and evaluation_result and should_eval:
+                # Summarize the work for the calling agent
+                summary = await _summarize_subagent_work(
+                    task_description=task_description,
+                    subagent_name=agent_name,
+                    full_context=final_streamed_content,
+                    evaluation=evaluation_result,
+                    original_payload=original_payload,
+                )
+
+                summary_visible = (
+                    f"\n**📝 SUMMARY for calling agent @{calling_agent_name}:** {summary}\n"
+                )
+                # Wrap in SSE format for UI to display
+                summary_sse = {
+                    "choices": [
+                        {
+                            "delta": {"role": "assistant", "content": summary_visible},
+                            "finish_reason": None,
+                            "index": 0,
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(summary_sse)}\n\n".encode()
+
+                # Also send marker for internal processing
+                summary_marker = f"__SUMMARY__{json.dumps({'content': summary})}__END__\n"
+                yield summary_marker.encode()
+
+                logger.info(f"Full summary for @{agent_name}: {summary}")
+                logger.info(f"Sent evaluation and summary markers for @{agent_name}")
+
+                # Store summary for potential use by calling agent
+                agent_streams_data[f"{agent_name}_summary"] = summary
 
             # Send agent end marker with chain
             chain_json = json.dumps(current_chain)
@@ -1608,7 +2062,7 @@ async def _stream_route_to_agents(
             yield end_marker.encode()
 
             # Check for agent-to-agent mentions in the streamed content
-            mentioned_agents = _check_response_for_mentions(streamed_content)
+            mentioned_agents = _check_response_for_mentions(final_streamed_content)
 
             if mentioned_agents and depth < max_depth:
                 logger.info(
@@ -1632,7 +2086,7 @@ async def _stream_route_to_agents(
 
                 if sub_agents:
                     # For subagent delegations, use summary if available
-                    content_for_next_agent = streamed_content
+                    content_for_next_agent = final_streamed_content
                     if is_subagent_delegation:
                         # Get the summary we just sent
                         # The summary should be used for the next agent's context

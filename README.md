@@ -80,6 +80,7 @@ Events use the marker format: `__TOOL_EVENT__{json}__END__` for UI parsing.
 - `tool_call_start` - Individual tool starting execution
 - `tool_call_end` - Individual tool completed (with result preview)
 - `tool_loop_complete` - All tool iterations finished (control signal)
+- `eval_event` - Meta-agent evaluation notifications (evaluation_start, evaluation_result, retry_attempt)
 
 Enable tools in `.env`:
 ```env
@@ -120,11 +121,14 @@ Forma includes a multi-agent architecture where specialized AI agents can discov
 - **Agent-to-Agent Delegation**: Agents can delegate tasks to other agents (max depth = 3)
 - **Streaming Support**: Multi-agent responses stream with agent markers
 - **Global Shared Memory**: All agents query the same RAG indexes with different retrieval configs
+- **Meta-Agent Evaluation**: Automatic quality control with evaluator/summarizer agents
 
 **Default Agents** (configured in `config/agents.json`):
 - **@assistant**: General coordinator - delegates to specialists
 - **@researcher**: Research specialist - web search, information gathering (tools: search_web, web_fetch)
 - **@coder**: Code specialist - code generation, debugging (no tools)
+- **@evaluator**: Meta-agent - evaluates subagent task completion (trusted, not evaluated itself)
+- **@summarizer**: Meta-agent - compacts subagent context into concise summaries (trusted)
 
 **Example Usage:**
 
@@ -161,6 +165,48 @@ Each agent has:
 - **Shared Memory**: All agents query the SAME global indexes (facts_index, recipes_index)
 - **Agent-Specific RAG**: Each agent has different retrieval thresholds via rag_config
 - **Web UI**: Manage agents at `http://localhost:8000/agents`
+
+### Meta-Agent Evaluation System
+
+When an agent delegates a task to a subagent, Forma automatically evaluates the quality of the response using meta-agents:
+
+**Evaluation Flow:**
+1. **Delegation**: Calling agent delegates task to subagent (e.g., @assistant → @researcher)
+2. **Execution**: Subagent executes task with its tools and configuration
+3. **Evaluation**: @evaluator assesses whether task was completed successfully
+4. **Retry Loop**: If incomplete, subagent retries with specific guidance (max 10 attempts)
+5. **Summarization**: @summarizer compacts subagent context before returning to caller
+
+**Evaluation States:**
+- `complete`: Task fully addressed with actionable results
+- `incomplete`: Partial progress, needs more depth/tools/verification
+- `failed`: Task impossible, wrong approach, should try different strategy
+
+**Automatic Retry with Guidance:**
+When evaluation returns `incomplete`, the system automatically retries with:
+- Previous response shown to subagent
+- Specific instructions from evaluator (e.g., "Use web_fetch tool to get full content")
+- Progressive refinement across attempts
+
+**SSE Streaming of Evaluation:**
+Evaluation events are streamed to the client in real-time:
+```
+__EVAL_EVENT__{"type": "evaluation_start", "subagent": "researcher"}__END__
+__EVAL_EVENT__{"type": "evaluation_result", "status": "incomplete", "reason": "..."}__END__
+__EVAL_EVENT__{"type": "retry_attempt", "attempt": 2, "max_attempts": 10}__END__
+```
+
+**Context Compaction:**
+When agent-to-agent conversations grow large, automatic compaction triggers at 90% of the context window:
+- Threshold: 90% of 38400 tokens (34560 tokens)
+- Most recent 4 messages preserved (last 2 exchanges)
+- Older messages summarized by @summarizer agent
+- For single large messages: iterative summarization reduces context progressively
+
+**Trusted Meta-Agents:**
+- @evaluator and @summarizer are marked as trusted in `config/agents.json`
+- Trusted agents do not get evaluated themselves (avoid infinite loops)
+- They have minimal RAG config (disabled, no context retrieval)
 
 See `docs/multi_agent_design.md` for detailed architecture and implementation documentation.
 
@@ -660,13 +706,14 @@ forma/
 │   ├── upstream_manager.py  # Multi-upstream routing
 │   ├── api.py               # Web UI API endpoints (upstreams + agents)
 │   ├── proxy.py             # OpenAI API proxy with upstream routing
-│   ├── agents/              # Multi-agent system
+│   ├── agents/               # Multi-agent system
 │   │   ├── __init__.py      # Agent exports
 │   │   ├── registry.py      # AgentRegistry (CRUD operations)
 │   │   ├── discovery.py     # Agent discovery context formatting
 │   │   ├── parser.py        # Parse agent mentions (RoutingType: MENTION, EXPLICIT)
 │   │   ├── router.py        # AgentRouter (mention-based routing only)
 │   │   ├── orchestrator.py  # Multi-agent orchestration (sequential)
+│   │   ├── meta_evaluation.py # Meta-agent evaluation/summarization helpers
 │   │   └── config_loader.py # Load agents from config/agents.json
 │   ├── tools/               # Server-side tool execution
 │   │   ├── __init__.py      # Tool exports
@@ -683,7 +730,7 @@ forma/
 │   └── prompts/
 │       └── extraction.txt   # Extraction prompt template
 ├── config/
-│   └── agents.json          # Agent configurations (assistant, researcher, coder)
+│   └── agents.json          # Agent configurations (assistant, researcher, coder, evaluator, summarizer)
 ├── webui/                   # Vue 3 SPA frontend
 │   ├── src/
 │   │   ├── components/

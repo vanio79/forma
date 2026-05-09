@@ -549,6 +549,120 @@ Each agent can use a different upstream model:
 - `src/forma/agents/registry.py` - Updated docstrings
 - `config/agents.json` - rag_config for each agent
 
+#### Phase 8: Meta-Agent Evaluation System - HIGH PRIORITY ✅ COMPLETE
+
+- ✅ Add @evaluator and @summarizer meta-agents to config/agents.json
+- ✅ Implement evaluation flow after subagent delegation
+- ✅ Implement retry loop with evaluator guidance (max 10 attempts)
+- ✅ Implement automatic context compaction at 90% threshold
+- ✅ SSE streaming of evaluation events (__EVAL_EVENT__ markers)
+- ✅ Iterative summarization for large single-message contexts
+- ✅ Trusted meta-agents don't get evaluated (avoid infinite loops)
+
+**Architecture:**
+
+```
+Calling Agent delegates task
+    │
+    ▼
+Subagent executes (isolated context)
+    │
+    ▼
+@evaluator assesses completion
+    │
+    ├─── complete ──→ @summarizer compacts context ──→ Return to caller
+    │
+    ├─── incomplete ──→ Retry with guidance (max 10 attempts)
+    │                      │
+    │                      ▼
+    │                   @evaluator reassesses
+    │
+    └─── failed ──→ @summarizer compacts context ──→ Return to caller
+```
+
+**Evaluation States:**
+- `complete`: Task fully addressed with sufficient detail, actionable results provided
+- `incomplete`: Partial progress, needs more depth/tools/verification, can be improved with guidance
+- `failed`: Task impossible, no relevant results, wrong approach, should try different strategy
+
+**EvaluationResult Data Structure:**
+```python
+@dataclass
+class EvaluationResult:
+    status: str          # "complete", "incomplete", "failed"
+    reason: str          # Brief explanation
+    retry_instructions: str | None  # Specific guidance (if incomplete)
+    summary_focus: str | None       # What to highlight (if complete/failed)
+    confidence: float   # 0.0-1.0
+    is_valid: bool      # Whether JSON was parsed correctly
+```
+
+**Retry Loop Mechanics:**
+1. Evaluator returns `incomplete` with specific `retry_instructions`
+2. System creates retry context with:
+   - Original task
+   - Previous subagent response
+   - Evaluator feedback
+3. Subagent executes again with guidance
+4. Loop continues until complete/failed or max attempts (10)
+5. Progressive refinement improves results each iteration
+
+**Context Compaction Strategy:**
+Automatic compaction triggers at 90% of context window (34560 tokens for 38400 window):
+- Check: `should_compact_context()` estimates token count
+- Trigger: When estimated tokens >= threshold
+- Preserve: Most recent 4 messages (last 2 exchanges)
+- Summarize: Older messages via @summarizer agent
+- Iterative: For single large messages (>1500 chars), chunk and summarize progressively
+
+**SSE Evaluation Events:**
+```typescript
+interface EvalEvent {
+  type: "evaluation_start" | "evaluation_result" | "retry_attempt";
+  subagent?: string;
+  status?: string;
+  reason?: string;
+  attempt?: number;
+  max_attempts?: number;
+}
+```
+
+Events streamed as: `__EVAL_EVENT__{json}__END__`
+
+**Example Retry Sequence:**
+```
+Attempt 1: @researcher finds links → Evaluator: incomplete (95%)
+           → Guidance: "Use web_fetch to get full article content"
+
+Attempt 2: @researcher fetches page → Evaluator: incomplete (90%)
+           → Guidance: "Extract specific recipe details from content"
+
+Attempt 3: @researcher parses recipe → Evaluator: complete (85%)
+           → @summarizer: "Found циганска баница recipe with ingredients..."
+```
+
+**Meta-Agent Configuration:**
+```json
+{
+  "name": "evaluator",
+  "purpose": "Meta-agent that evaluates subagent task completion",
+  "instruction_prompt": "Assess task completion and output JSON...",
+  "tools_enabled": false,
+  "rag_config": { "enabled": false }
+}
+```
+
+Key traits:
+- No tools enabled (evaluator just assesses, doesn't act)
+- No RAG retrieval (isolated assessment)
+- Trusted flag prevents evaluation of evaluator itself
+
+**Files:**
+- `config/agents.json` - Added @evaluator and @summarizer configurations
+- `src/forma/agents/meta_evaluation.py` - EvaluationResult, parsing, context helpers
+- `src/forma/main.py` - Evaluation flow integration (lines 1750-2040), SSE events
+- `webui/src/api.ts` - Eval event parsing for UI display
+
 ### Example Use Cases
 
 #### 1. Research + Summarization (Sequential)
@@ -585,32 +699,51 @@ def sort_list(items):
 Efficiency analysis: Uses Python's built-in sorted(), which is O(n log n)...
 ```
 
-#### 3. Agent-to-Agent Delegation
+#### 3. Agent-to-Agent Delegation (with Meta-Agent Evaluation)
 
 ```
-User: "@assistant research Python asyncio and provide a code example"
+User: "@assistant find a recipe for циганска баница"
 
 Response:
 --- [@assistant]
-@researcher please search for Python asyncio tutorials
+Delegating to @researcher: Find a recipe for циганска баница
 
---- [@researcher]
-I found comprehensive tutorials. Python asyncio is used for concurrent I/O-bound tasks...
+--- [@researcher] (Attempt 1)
+I found several search results mentioning циганска баница:
+- https://example.com/recipe1
+- https://example.com/recipe2
 
---- [@coder]
-Here's a working asyncio example:
-```python
-import asyncio
+[Evaluation: incomplete (95%) - need full recipe details]
+[Retry guidance: Use web_fetch to get article content]
 
-async def main():
-    await asyncio.sleep(1)
-    print("Hello async!")
+--- [@researcher] (Attempt 2)
+I fetched the article. It mentions traditional Bulgarian pastry...
+[Evaluation: incomplete (90%) - missing ingredients/instructions]
+[Retry guidance: Parse and extract recipe details]
 
-asyncio.run(main())
+--- [@researcher] (Attempt 3)
+Recipe for циганска баница:
+Ingredients: filo dough, eggs, yogurt, cheese, butter...
+Instructions: 1. Layer filo sheets, 2. Mix filling...
+
+[Evaluation: complete (85%)]
+
+--- [@summarizer]
+Summary: Found traditional Bulgarian циганска баница recipe with filo dough, 
+cheese filling, and step-by-step layering instructions.
+
+--- [@assistant]
+Here's the recipe for циганска баница that @researcher found:
+[recipe details from summary]
 ```
-```
 
-Agents can delegate to other agents, creating delegation chains (max depth = 3).
+The meta-agent evaluation system ensures:
+- Subagent actually completes the delegated task
+- Incomplete responses get specific retry guidance
+- Context is summarized before returning to caller
+- Quality threshold enforced (no "I searched" without results)
+
+Agents can delegate to other agents, creating delegation chains (max depth = 3). Each delegation is evaluated by @evaluator.
 
 ### Testing Strategy
 
@@ -725,6 +858,51 @@ AGENTS_DISCOVERY_ENABLED=true
 
 **Note:** The `rag_config` field controls agent-specific retrieval parameters from the GLOBAL shared indexes.
 
+#### Meta-Agent Configuration (Phase 8)
+
+Meta-agents are special agents that manage quality control and context optimization:
+
+```json
+{
+  "name": "evaluator",
+  "purpose": "Meta-agent that evaluates subagent task completion",
+  "instruction_prompt": "You are an evaluator agent. Assess task completion...",
+  "upstream": null,
+  "tools_enabled": false,
+  "tool_whitelist": [],
+  "max_iterations": 1,
+  "is_enabled": true,
+  "rag_config": {
+    "enabled": false,
+    "token_budget": 0,
+    "min_confidence": 0.0,
+    "max_distance": 1.0
+  }
+},
+{
+  "name": "summarizer",
+  "purpose": "Meta-agent that compacts subagent context into concise summaries",
+  "instruction_prompt": "You are a summarizer agent. Create concise summaries...",
+  "upstream": null,
+  "tools_enabled": false,
+  "tool_whitelist": [],
+  "max_iterations": 1,
+  "is_enabled": true,
+  "rag_config": {
+    "enabled": false,
+    "token_budget": 0,
+    "min_confidence": 0.0,
+    "max_distance": 1.0
+  }
+}
+```
+
+**Key Meta-Agent Traits:**
+- **No tools**: Evaluator/summarizer don't use tools (they assess/summarize only)
+- **No RAG**: Disabled RAG retrieval (isolated assessment/summarization)
+- **Trusted**: Not evaluated themselves (avoid infinite meta-agent loops)
+- **Single iteration**: max_iterations=1 (quick single-pass operations)
+
 ## Design Decisions (Resolved)
 
 1. **Agent memory sharing**: ✅ RESOLVED - Shared memory globally
@@ -748,7 +926,21 @@ AGENTS_DISCOVERY_ENABLED=true
    - **Role**: Coordinator that delegates to specialist agents
 
 5. **Broadcast messaging**: ✅ RESOLVED - NO broadcast support
-   - **Decision**: NO @all broadcast syntax, only mention-based routing (@agent_name)
-   - **Implementation**: Removed all broadcast-related code from router, orchestrator, main.py
-   - **Reason**: Broadcast creates coordination complexity without clear benefit
-   - **Removed**: RoutingType.BROADCAST, get_broadcast_agents(), has_broadcast checks
+    - **Decision**: NO @all broadcast syntax, only mention-based routing (@agent_name)
+    - **Implementation**: Removed all broadcast-related code from router, orchestrator, main.py
+    - **Reason**: Broadcast creates coordination complexity without clear benefit
+    - **Removed**: RoutingType.BROADCAST, get_broadcast_agents(), has_broadcast checks
+
+6. **Subagent quality control**: ✅ RESOLVED - Meta-agent evaluation
+    - **Decision**: Automatic evaluation of subagent task completion by @evaluator meta-agent
+    - **Implementation**: EvaluationResult with complete/incomplete/failed states, retry loop with guidance
+    - **Reason**: Prevents low-quality delegations from polluting calling agent's context
+    - **Retry**: Max 10 attempts with progressive refinement based on evaluator feedback
+    - **Summarization**: @summarizer compacts context before returning to caller
+
+7. **Context overflow in multi-agent**: ✅ RESOLVED - Automatic compaction at 90%
+    - **Decision**: Trigger context compaction when estimated tokens reach 90% of window
+    - **Implementation**: `should_compact_context()` with char-based token estimation
+    - **Threshold**: 34560 tokens for 38400 window, preserves last 4 messages
+    - **Iterative**: For large single messages, chunk and summarize progressively
+    - **Reason**: Prevents context overflow errors during long agent-to-agent conversations

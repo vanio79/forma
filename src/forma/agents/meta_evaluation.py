@@ -2,6 +2,9 @@
 
 Handles evaluation of subagent task completion and summarization of results.
 This ensures quality control and prevents context pollution.
+
+Also handles automatic context compaction for agent-to-agent conversations
+to prevent context overflow during multi-agent interactions.
 """
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -268,3 +272,106 @@ def extract_summary(response_content: str) -> str:
         return content[:250] + "..."
 
     return content
+
+
+def estimate_messages_tokens(
+    messages: list[dict[str, Any]],
+    chars_per_token: int = 4,
+) -> int:
+    """Estimate token count for a messages array.
+
+    Uses character-based estimation (4 chars per token is a reasonable default).
+
+    Args:
+        messages: Array of message dicts with 'role' and 'content'
+        chars_per_token: Characters per token ratio (default: 4)
+
+    Returns:
+        Estimated token count
+    """
+    total_chars = 0
+    for msg in messages:
+        # Count role overhead (system/user/assistant/tool)
+        total_chars += len(msg.get("role", "")) + 10  # role + JSON overhead
+
+        # Count content
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            # Multi-modal content (text + images)
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total_chars += len(part.get("text", ""))
+
+    return total_chars // chars_per_token
+
+
+def should_compact_context(
+    messages: list[dict[str, Any]],
+    context_window_size: int,
+    compaction_threshold: float = 0.90,
+    chars_per_token: int = 4,
+) -> bool:
+    """Check if context should be compacted.
+
+    Args:
+        messages: Current messages array
+        context_window_size: Maximum context window in tokens
+        compaction_threshold: Trigger compaction at this percentage (default: 90%)
+        chars_per_token: Characters per token ratio
+
+    Returns:
+        True if compaction should be triggered
+    """
+    estimated_tokens = estimate_messages_tokens(messages, chars_per_token)
+    threshold_tokens = int(context_window_size * compaction_threshold)
+
+    should_compact = estimated_tokens >= threshold_tokens
+
+    if should_compact:
+        logger.info(
+            f"Context compaction needed: {estimated_tokens} tokens "
+            f"(threshold: {threshold_tokens}, window: {context_window_size})"
+        )
+
+    return should_compact
+
+
+def build_compaction_input(messages_to_summarize: list[dict[str, Any]]) -> str:
+    """Build input for summarizer agent to compact conversation history.
+
+    Args:
+        messages_to_summarize: Messages to be summarized
+
+    Returns:
+        Formatted prompt for summarizer
+    """
+    # Format messages as conversation transcript
+    transcript_parts = []
+    for msg in messages_to_summarize:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            transcript_parts.append(f"{role.upper()}: {content}")
+        elif isinstance(content, list):
+            # Handle multi-modal content (just extract text parts)
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+            if text_parts:
+                transcript_parts.append(f"{role.upper()}: {' '.join(text_parts)}")
+
+    transcript = "\n\n".join(transcript_parts)
+
+    return (
+        f"Summarize this conversation to compact it for future context:\n\n"
+        f"{transcript}\n\n"
+        f"Provide a concise summary (50-200 tokens) that:\n"
+        f"- Captures key information and decisions\n"
+        f"- Preserves essential context for continuing work\n"
+        f"- Lists important files/code entities mentioned\n"
+        f"- Notes current state and next steps\n\n"
+        f"Format: 'Summary: [key points in 1-3 sentences]'"
+    )

@@ -57,6 +57,12 @@ class Settings(BaseSettings):
     agents_default_name: str = "assistant"  # Default agent name when none specified
     agents_discovery_enabled: bool = True  # Enable agent discovery augmentation
 
+    # Context management configuration (auto-compaction for agent chains)
+    context_window_size: int = 34560  # Default context window size (matches gemma-4-e4b-it)
+    context_compaction_threshold: float = 0.90  # Trigger compaction at 90% of window
+    context_keep_recent_messages: int = 4  # Keep last 4 messages (2 exchanges) during compaction
+    context_chars_per_token: int = 4  # Approximate characters per token for estimation
+
 
 @lru_cache
 def get_settings() -> Settings:
