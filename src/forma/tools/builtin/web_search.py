@@ -3,7 +3,10 @@
 import time
 from typing import Any
 
-from duckduckgo_search import DDGS
+try:
+    from ddgs import DDGS
+except ImportError:
+    from duckduckgo_search import DDGS  # Fallback for older installations
 
 from forma.tools.base import SyncTool, ToolResult
 

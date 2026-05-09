@@ -9,6 +9,7 @@
           <router-link to="/" class="nav-link">Dashboard</router-link>
           <router-link to="/requests" class="nav-link">Requests</router-link>
           <router-link to="/upstreams" class="nav-link">Upstreams</router-link>
+          <router-link to="/agents" class="nav-link">Agents</router-link>
           <router-link to="/chat" class="nav-link">Chat</router-link>
         </nav>
       </div>

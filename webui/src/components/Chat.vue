@@ -98,7 +98,15 @@
           <!-- Regular user/assistant messages -->
           <template v-else>
             <div class="message-header">
-              <span class="message-role">{{ msg.role === 'user' ? 'You' : 'Assistant' }}</span>
+              <span class="message-role">
+                <template v-if="msg.role === 'user'">You</template>
+                <template v-else-if="msg.agentChain && msg.agentChain.length > 1">
+                  🤖 @{{ msg.agentChain.join(' → @') }}
+                </template>
+                <template v-else-if="msg.agentName">🤖 @{{ msg.agentName }}</template>
+                <template v-else-if="currentAgent && msg.isStreaming">🤖 @{{ currentAgent }}</template>
+                <template v-else>Assistant</template>
+              </span>
               <span class="message-time">{{ formatTime(msg.timestamp ?? Date.now()) }}</span>
             </div>
             
@@ -228,7 +236,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, nextTick } from "vue";
-import type { Upstream, ChatMessage, ToolEvent, ToolExecutionState, ToolCallInfo } from "../types";
+import type { Upstream, ChatMessage, ToolEvent, ToolExecutionState, ToolCallInfo, AgentEvent } from "../types";
 import { getUpstreams, streamChatCompletion } from "../api";
 
 const upstreams = ref<Upstream[]>([]);
@@ -255,6 +263,11 @@ const toolExecutionState = ref<ToolExecutionState>({
   isComplete: false,
   totalTimeMs: 0,
 });
+
+// Agent tracking state
+const currentAgent = ref<string | null>(null);  // Which agent is currently responding
+const agentResponses = ref<Record<string, string>>({});  // Track content by agent name
+const agentMessageIndices = ref<Record<string, number>>({});  // Track message index for each agent
 
 // Actual token usage tracking (from API responses)
 const promptTokens = ref(0);
@@ -360,6 +373,53 @@ function handleToolEvent(event: ToolEvent): void {
   } else if (event.type === "tool_loop_complete") {
     state.isComplete = true;
     state.totalTimeMs = event.total_tool_time_ms ?? 0;
+  }
+  
+  scrollToBottom();
+}
+
+// Agent event handler - creates separate messages for each agent
+function handleAgentEvent(event: AgentEvent): void {
+  if (event.type === "agent_start") {
+    // Agent is starting - create a NEW message for this agent
+    currentAgent.value = event.agent;
+    agentResponses.value[event.agent] = "";
+    
+    // Create a new message for this agent
+    const agentMsg: ChatMessage = {
+      role: "assistant",
+      content: "",
+      reasoning: "",
+      timestamp: Date.now(),
+      isStreaming: true,
+      showReasoning: true,
+      agentName: event.agent,
+      agentChain: event.chain,  // Store the delegation chain
+      toolExecution: event.depth === 0 ? toolExecutionState.value : undefined,  // Only track tools for top-level agent
+      toolExecutionExpanded: false,
+    };
+    messages.value.push(agentMsg);
+    agentMessageIndices.value[event.agent] = messages.value.length - 1;
+    
+  } else if (event.type === "agent_end") {
+    // Agent finished - mark its message as complete
+    const msgIndex = agentMessageIndices.value[event.agent];
+    if (msgIndex !== undefined && messages.value[msgIndex]) {
+      messages.value[msgIndex].isStreaming = false;
+      messages.value[msgIndex].timestamp = Date.now();
+      
+      // If this agent had tool calls, mark tool execution as complete
+      if (toolExecutionState.value.toolCalls.length > 0 && event.depth === 0) {
+        toolExecutionState.value.isComplete = true;
+        messages.value[msgIndex].toolExecution = toolExecutionState.value;
+      }
+      
+      // Hide reasoning section if empty
+      if (!messages.value[msgIndex].reasoning) {
+        messages.value[msgIndex].showReasoning = false;
+      }
+    }
+    currentAgent.value = null;
   }
   
   scrollToBottom();
@@ -495,6 +555,11 @@ async function sendMessage(): Promise<void> {
     totalTimeMs: 0,
   };
 
+  // Reset agent state for new message
+  currentAgent.value = null;
+  agentResponses.value = {};
+  agentMessageIndices.value = {};
+
   // Add user message
   const userMsg: ChatMessage = {
     role: "user",
@@ -511,58 +576,86 @@ async function sendMessage(): Promise<void> {
     content: m.content,
   }));
 
-  // Add assistant message placeholder that will stream into
-  const assistantMsg: ChatMessage = {
-    role: "assistant",
-    content: "",
-    reasoning: "",
-    timestamp: Date.now(),
-    isStreaming: true,
-    showReasoning: true,  // Show reasoning by default when it's being streamed
-    toolExecution: toolExecutionState.value,  // Track tool execution
-    toolExecutionExpanded: false,  // Tool execution details collapsed by default
-  };
-  messages.value.push(assistantMsg);
-  const assistantMsgIndex = messages.value.length - 1;
-  scrollToBottom();
+  // DON'T create assistant message placeholder upfront
+  // Messages will be created by handleAgentEvent when AGENT_START events come
+  // If no AGENT_START events come (non-agent request), we'll create a fallback message
 
-  // Start streaming - stream directly into the message in the array
+  // Start streaming
   isStreaming.value = true;
+  let hasReceivedAgentStart = false;
 
   try {
     await streamChatCompletion(
       selectedModel.value,
       apiMessages,
       (chunk: string) => {
-        // Stream content directly into the message
-        messages.value[assistantMsgIndex].content += chunk;
+        // If no agent started yet, create a fallback message
+        if (!hasReceivedAgentStart && !currentAgent.value) {
+          hasReceivedAgentStart = true;
+          const fallbackMsg: ChatMessage = {
+            role: "assistant",
+            content: "",
+            reasoning: "",
+            timestamp: Date.now(),
+            isStreaming: true,
+            showReasoning: true,
+            toolExecution: toolExecutionState.value,
+            toolExecutionExpanded: false,
+          };
+          messages.value.push(fallbackMsg);
+          agentMessageIndices.value["fallback"] = messages.value.length - 1;
+        }
+        
+        // Stream content into the current agent's message
+        const currentAgentName = currentAgent.value || "fallback";
+        const msgIndex = agentMessageIndices.value[currentAgentName];
+        if (msgIndex !== undefined && messages.value[msgIndex]) {
+          messages.value[msgIndex].content += chunk;
+          agentResponses.value[currentAgentName] += chunk;
+        }
         scrollToBottom();
       },
       () => {
-        // Stream complete - mark message as not streaming
-        messages.value[assistantMsgIndex].isStreaming = false;
-        messages.value[assistantMsgIndex].timestamp = Date.now();
+        // Stream complete - handle all agent messages
+        // Mark any still-streaming messages as complete
+        messages.value.forEach(msg => {
+          if (msg.isStreaming) {
+            msg.isStreaming = false;
+            msg.timestamp = Date.now();
+          }
+          
+          // Hide reasoning section if empty
+          if (!msg.reasoning) {
+            msg.showReasoning = false;
+          }
+          
+          // Mark tool execution as complete if there were tool calls
+          if (msg.toolExecution && msg.toolExecution.toolCalls.length > 0) {
+            msg.toolExecution.isComplete = true;
+          }
+        });
         
-        // Hide reasoning section after streaming if it's empty
-        if (!messages.value[assistantMsgIndex].reasoning) {
-          messages.value[assistantMsgIndex].showReasoning = false;
-        }
-        
-        // Mark tool execution as complete if there were tool calls
-        if (toolExecutionState.value.toolCalls.length > 0) {
-          toolExecutionState.value.isComplete = true;
-          messages.value[assistantMsgIndex].toolExecution = toolExecutionState.value;
-        }
+        // Clear agent state
+        currentAgent.value = null;
         
         isStreaming.value = false;
         scrollToBottom();
         
         // Estimate tokens for the new messages
         const userTokens = Math.ceil(userMsg.content.length / 4);
-        const assistantTokens = Math.ceil(messages.value[assistantMsgIndex].content.length / 4);
-        const reasoningTokens = Math.ceil((messages.value[assistantMsgIndex].reasoning?.length || 0) / 4);
+        let totalAssistantTokens = 0;
+        let totalReasoningTokens = 0;
+        
+        // Sum tokens from all agent messages added in this response
+        Object.values(agentMessageIndices.value).forEach(idx => {
+          if (messages.value[idx]) {
+            totalAssistantTokens += Math.ceil(messages.value[idx].content.length / 4);
+            totalReasoningTokens += Math.ceil((messages.value[idx].reasoning?.length || 0) / 4);
+          }
+        });
+        
         promptTokens.value += userTokens;
-        completionTokens.value += assistantTokens + reasoningTokens;
+        completionTokens.value += totalAssistantTokens + totalReasoningTokens;
         
         // Trigger compaction AFTER response completes (like OpenCode)
         compactMessages();
@@ -573,21 +666,43 @@ async function sendMessage(): Promise<void> {
         });
       },
       (err: string) => {
-        // On error, remove the failed assistant message
-        messages.value.pop();
+        // On error, remove all messages added for this request
+        // Remove fallback message if it exists
+        if (agentMessageIndices.value["fallback"] !== undefined) {
+          messages.value.splice(agentMessageIndices.value["fallback"], 1);
+        }
+        // Remove all agent messages
+        Object.values(agentMessageIndices.value).forEach(idx => {
+          if (idx !== agentMessageIndices.value["fallback"]) {
+            messages.value.splice(idx, 1);
+          }
+        });
         error.value = err;
         isStreaming.value = false;
       },
       (reasoningChunk: string) => {
-        // Stream reasoning content
-        messages.value[assistantMsgIndex].reasoning += reasoningChunk;
+        // Stream reasoning content to current agent's message
+        const currentAgentName = currentAgent.value || "fallback";
+        const msgIndex = agentMessageIndices.value[currentAgentName];
+        if (msgIndex !== undefined && messages.value[msgIndex]) {
+          messages.value[msgIndex].reasoning += reasoningChunk;
+        }
         scrollToBottom();
       },
       (toolEvent: ToolEvent) => {
         // Handle tool execution events
         handleToolEvent(toolEvent);
-        // Update the message's tool execution state
-        messages.value[assistantMsgIndex].toolExecution = toolExecutionState.value;
+        // Update the tool execution state on the current agent's message
+        const currentAgentName = currentAgent.value || "fallback";
+        const msgIndex = agentMessageIndices.value[currentAgentName];
+        if (msgIndex !== undefined && messages.value[msgIndex]) {
+          messages.value[msgIndex].toolExecution = toolExecutionState.value;
+        }
+      },
+      (agentEvent: AgentEvent) => {
+        // Handle agent start/end events
+        hasReceivedAgentStart = true;
+        handleAgentEvent(agentEvent);
       }
     );
   } catch (e) {
@@ -1160,6 +1275,16 @@ onMounted(loadUpstreams);
   background-color: #f6ffed;
   padding: 0.25rem 0.5rem;
   border-radius: 2px;
+}
+
+/* Agent badge styles */
+.message-role {
+  font-weight: 500;
+}
+
+/* Agent emoji indicator */
+.message-role::first-line {
+  line-height: 1.2;
 }
 
 @keyframes pulse {

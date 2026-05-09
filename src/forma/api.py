@@ -29,6 +29,13 @@ def _get_db():
     return db
 
 
+def _get_agent_registry():
+    """Get the agent registry instance (lazy loading to avoid circular imports)."""
+    from forma.main import agent_registry
+
+    return agent_registry
+
+
 @router.get("/stats")
 async def get_stats():
     """Get summary statistics for the dashboard."""
@@ -303,3 +310,236 @@ async def reload_upstreams():
         proxy.reload_upstreams()
         return JSONResponse({"status": "ok", "message": "Upstreams reloaded"})
     return JSONResponse({"status": "error", "message": "Proxy not initialized"})
+
+
+# === Agent Management ===
+
+
+@router.get("/agents")
+async def get_agents():
+    """Get all agent configurations."""
+    agent_registry = _get_agent_registry()
+    if not agent_registry:
+        return JSONResponse({"agents": [], "message": "Agent system disabled"})
+
+    agents = agent_registry.get_all_agents()
+
+    # Format agents for frontend
+    formatted_agents = []
+    for agent in agents:
+        import json
+
+        tool_whitelist_str = agent.get("tool_whitelist", "[]")
+        try:
+            tool_whitelist = (
+                json.loads(tool_whitelist_str)
+                if isinstance(tool_whitelist_str, str)
+                else tool_whitelist_str
+            )
+        except (json.JSONDecodeError, TypeError):
+            tool_whitelist = []
+
+        formatted_agents.append(
+            {
+                "id": agent["id"],
+                "name": agent["name"],
+                "purpose": agent["purpose"],
+                "instruction_prompt": agent["instruction_prompt"],
+                "upstream_id": agent["upstream_id"],
+                "tools_enabled": agent["tools_enabled"],
+                "tool_whitelist": tool_whitelist,
+                "max_iterations": agent["max_iterations"],
+                "is_enabled": agent["is_enabled"],
+                "created_at": agent["created_at"],
+                "updated_at": agent["updated_at"],
+            }
+        )
+
+    return JSONResponse({"agents": formatted_agents})
+
+
+@router.post("/agents")
+async def create_agent(
+    name: str = Query(..., min_length=1, max_length=100),
+    purpose: str = Query(..., min_length=1),
+    instruction_prompt: str = Query(..., min_length=1),
+    upstream_id: str | None = Query(default=None),
+    tools_enabled: bool = Query(default=True),
+    tool_whitelist: str = Query(default="[]"),  # JSON array as string
+    max_iterations: int = Query(default=5, ge=1, le=20),
+    is_enabled: bool = Query(default=True),
+):
+    """Create a new agent configuration.
+
+    Args:
+        name: Unique agent name (used for @agent_name mentions)
+        purpose: Brief description of agent's role
+        instruction_prompt: System prompt / instruction for this agent
+        upstream_id: Reference to upstream config (null = use default)
+        tools_enabled: Whether tools are enabled for this agent
+        tool_whitelist: JSON array of allowed tool names (empty = all tools)
+        max_iterations: Max tool iterations for this agent
+        is_enabled: Whether agent is active
+    """
+    agent_registry = _get_agent_registry()
+    if not agent_registry:
+        raise HTTPException(status_code=503, detail="Agent system disabled")
+
+    try:
+        import json
+
+        whitelist = json.loads(tool_whitelist) if tool_whitelist else []
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid tool_whitelist JSON")
+
+    try:
+        agent_id = agent_registry.register_agent(
+            name=name,
+            purpose=purpose,
+            instruction_prompt=instruction_prompt,
+            upstream_id=upstream_id,
+            tools_enabled=tools_enabled,
+            tool_whitelist=whitelist,
+            max_iterations=max_iterations,
+            is_enabled=is_enabled,
+        )
+
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": "Agent created",
+                "agent": agent_registry.get_agent(agent_id),
+            }
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/agents/{agent_id}")
+async def get_agent(agent_id: str):
+    """Get a specific agent configuration."""
+    agent_registry = _get_agent_registry()
+    if not agent_registry:
+        raise HTTPException(status_code=503, detail="Agent system disabled")
+
+    agent = agent_registry.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    import json
+
+    tool_whitelist_str = agent.get("tool_whitelist", "[]")
+    try:
+        tool_whitelist = (
+            json.loads(tool_whitelist_str)
+            if isinstance(tool_whitelist_str, str)
+            else tool_whitelist_str
+        )
+    except (json.JSONDecodeError, TypeError):
+        tool_whitelist = []
+
+    return JSONResponse(
+        {
+            "agent": {
+                "id": agent["id"],
+                "name": agent["name"],
+                "purpose": agent["purpose"],
+                "instruction_prompt": agent["instruction_prompt"],
+                "upstream_id": agent["upstream_id"],
+                "tools_enabled": agent["tools_enabled"],
+                "tool_whitelist": tool_whitelist,
+                "max_iterations": agent["max_iterations"],
+                "is_enabled": agent["is_enabled"],
+                "created_at": agent["created_at"],
+                "updated_at": agent["updated_at"],
+            }
+        }
+    )
+
+
+@router.put("/agents/{agent_id}")
+async def update_agent(
+    agent_id: str,
+    name: str | None = Query(default=None, min_length=1, max_length=100),
+    purpose: str | None = Query(default=None, min_length=1),
+    instruction_prompt: str | None = Query(default=None, min_length=1),
+    upstream_id: str | None = Query(default=None),
+    tools_enabled: bool | None = Query(default=None),
+    tool_whitelist: str | None = Query(default=None),  # JSON array as string
+    max_iterations: int | None = Query(default=None, ge=1, le=20),
+    is_enabled: bool | None = Query(default=None),
+):
+    """Update an agent configuration.
+
+    Args:
+        name: Unique agent name
+        purpose: Brief description of agent's role
+        instruction_prompt: System prompt / instruction for this agent
+        upstream_id: Reference to upstream config (null = use default)
+        tools_enabled: Whether tools are enabled for this agent
+        tool_whitelist: JSON array of allowed tool names (empty = all tools)
+        max_iterations: Max tool iterations for this agent
+        is_enabled: Whether agent is active
+    """
+    agent_registry = _get_agent_registry()
+    if not agent_registry:
+        raise HTTPException(status_code=503, detail="Agent system disabled")
+
+    # Check if agent exists
+    existing = agent_registry.get_agent(agent_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    # Build updates dict
+    updates = {}
+    if name is not None:
+        updates["name"] = name
+    if purpose is not None:
+        updates["purpose"] = purpose
+    if instruction_prompt is not None:
+        updates["instruction_prompt"] = instruction_prompt
+    if upstream_id is not None:
+        updates["upstream_id"] = upstream_id
+    if tools_enabled is not None:
+        updates["tools_enabled"] = tools_enabled
+    if tool_whitelist is not None:
+        try:
+            import json
+
+            updates["tool_whitelist"] = json.loads(tool_whitelist)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid tool_whitelist JSON")
+    if max_iterations is not None:
+        updates["max_iterations"] = max_iterations
+    if is_enabled is not None:
+        updates["is_enabled"] = is_enabled
+
+    try:
+        agent_registry.update_agent(agent_id, **updates)
+
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": "Agent updated",
+                "agent": agent_registry.get_agent(agent_id),
+            }
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/agents/{agent_id}")
+async def delete_agent(agent_id: str):
+    """Delete an agent configuration."""
+    agent_registry = _get_agent_registry()
+    if not agent_registry:
+        raise HTTPException(status_code=503, detail="Agent system disabled")
+
+    # Check if agent exists
+    existing = agent_registry.get_agent(agent_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    agent_registry.delete_agent(agent_id)
+
+    return JSONResponse({"status": "ok", "message": "Agent deleted"})

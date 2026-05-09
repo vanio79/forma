@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     tools_timeout: float = 30.0  # Default timeout for tool execution (seconds)
     tools_stream_events: bool = False  # Stream tool execution events to client (Phase 4)
 
+    # Multi-Agent system configuration
+    agents_enabled: bool = True  # Enable multi-agent system
+    agents_config_path: str = "./config/agents.json"  # Path to agents configuration file
+    agents_default_name: str = "assistant"  # Default agent name when none specified
+    agents_discovery_enabled: bool = True  # Enable agent discovery augmentation
+
 
 @lru_cache
 def get_settings() -> Settings:

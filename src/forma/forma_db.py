@@ -34,6 +34,22 @@ class FormaDatabase:
         updated_at INTEGER NOT NULL
     );
     
+    CREATE TABLE IF NOT EXISTS agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        purpose TEXT NOT NULL,
+        instruction_prompt TEXT NOT NULL,
+        upstream_id TEXT NULL,
+        tools_enabled INTEGER DEFAULT 0,
+        tool_whitelist TEXT DEFAULT '[]',
+        max_iterations INTEGER DEFAULT 5,
+        is_enabled INTEGER DEFAULT 1,
+        rag_config TEXT DEFAULT '{}',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (upstream_id) REFERENCES upstreams(id)
+    );
+    
     CREATE TABLE IF NOT EXISTS requests (
         id TEXT PRIMARY KEY,
         model TEXT,
@@ -65,6 +81,8 @@ class FormaDatabase:
     );
     
     CREATE INDEX IF NOT EXISTS idx_upstreams_name ON upstreams(name);
+    CREATE INDEX IF NOT EXISTS idx_agents_name ON agents(name);
+    CREATE INDEX IF NOT EXISTS idx_agents_enabled ON agents(is_enabled);
     CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
     CREATE INDEX IF NOT EXISTS idx_requests_upstream_id ON requests(upstream_id);
     CREATE INDEX IF NOT EXISTS idx_extractions_request_id ON extractions(request_id);
@@ -114,6 +132,22 @@ class FormaDatabase:
             # Add extraction_prompt column if it doesn't exist (migration)
             try:
                 conn.execute("ALTER TABLE requests ADD COLUMN extraction_prompt TEXT")
+            except sqlite3.OperationalError:
+                # Column already exists, ignore
+                pass
+            # Add agent_id column if it doesn't exist (migration for multi-agent)
+            try:
+                conn.execute("ALTER TABLE requests ADD COLUMN agent_id TEXT DEFAULT ''")
+                # Create index for agent_id after column is added
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_requests_agent_id ON requests(agent_id)"
+                )
+            except sqlite3.OperationalError:
+                # Column or index already exists, ignore
+                pass
+            # Add rag_config column if it doesn't exist (migration for agent-specific RAG)
+            try:
+                conn.execute("ALTER TABLE agents ADD COLUMN rag_config TEXT DEFAULT '{}'")
             except sqlite3.OperationalError:
                 # Column already exists, ignore
                 pass
@@ -550,9 +584,189 @@ class FormaDatabase:
     def delete_upstream(self, upstream_id: str) -> bool:
         """Delete an upstream configuration."""
         with self._transaction() as conn:
+            # Check if any agents reference this upstream
+            agents = conn.execute(
+                "SELECT name FROM agents WHERE upstream_id = ?", (upstream_id,)
+            ).fetchall()
+            if agents:
+                logger.warning(
+                    f"Cannot delete upstream {upstream_id}: used by agents {[a[0] for a in agents]}"
+                )
+                return False
+
             result = conn.execute("DELETE FROM upstreams WHERE id = ?", (upstream_id,))
             if result.rowcount > 0:
                 logger.info(f"Deleted upstream: {upstream_id}")
+                return True
+        return False
+
+    # === Agent Management ===
+
+    def _convert_agent_row(self, row: sqlite3.Row) -> dict:
+        """Convert a database row to a dict with proper type conversions."""
+        data = dict(row)
+        # Convert integer fields to boolean
+        data["is_enabled"] = bool(data.get("is_enabled", 1))
+        data["tools_enabled"] = bool(data.get("tools_enabled", 0))
+        # Parse tool_whitelist JSON
+        whitelist_str = data.get("tool_whitelist", "[]")
+        try:
+            data["tool_whitelist"] = json.loads(whitelist_str) if whitelist_str else []
+        except json.JSONDecodeError:
+            data["tool_whitelist"] = []
+        # Parse rag_config JSON
+        rag_config_str = data.get("rag_config", "{}")
+        try:
+            data["rag_config"] = json.loads(rag_config_str) if rag_config_str else {}
+        except json.JSONDecodeError:
+            data["rag_config"] = {}
+        return data
+
+    def get_agents(self) -> list[dict]:
+        """Get all agent configurations."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM agents ORDER BY name ASC").fetchall()
+        return [self._convert_agent_row(row) for row in rows]
+
+    def get_enabled_agents(self) -> list[dict]:
+        """Get all enabled agent configurations."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM agents WHERE is_enabled = 1 ORDER BY name ASC"
+        ).fetchall()
+        return [self._convert_agent_row(row) for row in rows]
+
+    def get_agent_by_id(self, agent_id: str) -> Optional[dict]:
+        """Get a specific agent by ID."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        return self._convert_agent_row(row) if row else None
+
+    def get_agent_by_name(self, name: str) -> Optional[dict]:
+        """Get a specific agent by name."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT * FROM agents WHERE name = ?", (name,)).fetchone()
+        return self._convert_agent_row(row) if row else None
+
+    def get_enabled_agent_by_name(self, name: str) -> Optional[dict]:
+        """Get an enabled agent by name."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM agents WHERE name = ? AND is_enabled = 1", (name,)
+        ).fetchone()
+        return self._convert_agent_row(row) if row else None
+
+    def create_agent(
+        self,
+        id: str,
+        name: str,
+        purpose: str,
+        instruction_prompt: str,
+        upstream_id: Optional[str] = None,
+        tools_enabled: bool = False,
+        tool_whitelist: list[str] = [],
+        max_iterations: int = 5,
+        is_enabled: bool = True,
+        rag_config: dict = {},
+    ) -> str:
+        """Create a new agent configuration.
+
+        Args:
+            id: Unique ID
+            name: Agent name (human-readable, used for routing like @researcher)
+            purpose: Brief description of agent's role
+            instruction_prompt: System prompt/instruction for this agent
+            upstream_id: Reference to upstream configuration (null = use default upstream)
+            tools_enabled: Whether tools are enabled for this agent
+            tool_whitelist: List of allowed tool names (empty = all tools)
+            max_iterations: Max tool iterations for this agent
+            is_enabled: Whether this agent is active
+            rag_config: RAG configuration dict (enabled, token_budget, min_confidence, max_distance)
+        """
+        timestamp = int(datetime.now(UTC).timestamp())
+        whitelist_json = json.dumps(tool_whitelist)
+        rag_config_json = json.dumps(rag_config)
+
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO agents (id, name, purpose, instruction_prompt, upstream_id,
+                                    tools_enabled, tool_whitelist, max_iterations,
+                                    is_enabled, rag_config, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    id,
+                    name,
+                    purpose,
+                    instruction_prompt,
+                    upstream_id,
+                    int(tools_enabled),
+                    whitelist_json,
+                    max_iterations,
+                    int(is_enabled),
+                    rag_config_json,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+        logger.info(f"Created agent: {name} ({purpose})")
+        return id
+
+    def update_agent(
+        self,
+        id: str,
+        name: str,
+        purpose: str,
+        instruction_prompt: str,
+        upstream_id: Optional[str] = None,
+        tools_enabled: bool = False,
+        tool_whitelist: list[str] = [],
+        max_iterations: int = 5,
+        is_enabled: bool = True,
+        rag_config: dict = {},
+    ) -> bool:
+        """Update an existing agent configuration."""
+        timestamp = int(datetime.now(UTC).timestamp())
+        whitelist_json = json.dumps(tool_whitelist)
+        rag_config_json = json.dumps(rag_config)
+
+        with self._transaction() as conn:
+            result = conn.execute(
+                """
+                UPDATE agents 
+                SET name = ?, purpose = ?, instruction_prompt = ?, upstream_id = ?,
+                    tools_enabled = ?, tool_whitelist = ?, max_iterations = ?,
+                    is_enabled = ?, rag_config = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    name,
+                    purpose,
+                    instruction_prompt,
+                    upstream_id,
+                    int(tools_enabled),
+                    whitelist_json,
+                    max_iterations,
+                    int(is_enabled),
+                    rag_config_json,
+                    timestamp,
+                    id,
+                ),
+            )
+
+            if result.rowcount > 0:
+                logger.info(f"Updated agent: {name}")
+                return True
+        return False
+
+    def delete_agent(self, agent_id: str) -> bool:
+        """Delete an agent configuration."""
+        with self._transaction() as conn:
+            result = conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+            if result.rowcount > 0:
+                logger.info(f"Deleted agent: {agent_id}")
                 return True
         return False
 

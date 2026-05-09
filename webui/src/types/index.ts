@@ -110,6 +110,8 @@ export interface ChatMessage {
   isStreaming?: boolean;  // For messages being streamed (assistant responses or compaction summaries)
   isCompacting?: boolean; // For compaction progress messages
   showReasoning?: boolean; // Whether reasoning section is expanded (UI state)
+  agentName?: string;  // Which agent generated this response (for multi-agent scenarios)
+  agentChain?: string[];  // Delegation chain showing how this agent was reached (e.g., ["assistant", "researcher"])
   // Tool execution state
   toolExecution?: ToolExecutionState;
   toolExecutionExpanded?: boolean; // Whether tool execution details are expanded (UI state)
@@ -208,4 +210,29 @@ export interface ChatCompletionResponse {
     finish_reason: string;
   }[];
   usage: TokenUsage;
+}
+
+// === Agent Types ===
+
+export type AgentEventType = "agent_start" | "agent_end";
+
+export interface AgentEvent {
+  type: AgentEventType;
+  agent: string;  // Agent name
+  depth?: number;  // Nesting depth (0 = primary agent, 1 = sub-agent, etc.)
+  chain?: string[];  // Delegation chain (e.g., ["assistant", "researcher", "coder"])
+}
+
+export interface Agent {
+  id: string;
+  name: string;
+  purpose: string;
+  instruction_prompt: string;
+  upstream_id: string | null;
+  tools_enabled: boolean;
+  tool_whitelist: string[];
+  max_iterations: number;
+  is_enabled: boolean;
+  created_at: number;
+  updated_at: number;
 }

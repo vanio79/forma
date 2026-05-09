@@ -21,6 +21,7 @@ def _escape_cypher_string(value: str) -> str:
     """
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
+
 # Vector index names for semantic search
 FACTS_VECTOR_INDEX = "facts_index"
 RECIPES_VECTOR_INDEX = "recipes_index"
@@ -760,8 +761,7 @@ class Storage:
                 "facts": stats_before["grafitodb"]["facts"] - stats_after["grafitodb"]["facts"],
                 "recipes": stats_before["grafitodb"]["recipes"]
                 - stats_after["grafitodb"]["recipes"],
-                "nodes": stats_before["grafitodb"]["nodes"]
-                - stats_after["grafitodb"]["nodes"],
+                "nodes": stats_before["grafitodb"]["nodes"] - stats_after["grafitodb"]["nodes"],
                 "relationships": stats_before["grafitodb"]["relationships"]
                 - stats_after["grafitodb"]["relationships"],
             },
@@ -956,19 +956,29 @@ class Storage:
         }
 
     def format_context_for_prompt(
-        self, context: dict[str, Any], available_tools: list[dict[str, Any]] | None = None
+        self,
+        context: dict[str, Any],
+        available_tools: list[dict[str, Any]] | None = None,
+        agent_discovery_context: str | None = None,
     ) -> str:
         """
         Format retrieved context for prompt augmentation.
 
         Returns a formatted string suitable for prepending to user message.
-        Optionally includes tool instructions if tools are available.
+        Optionally includes agent discovery context and tool instructions.
 
         Args:
             context: Retrieved context (relationships, facts, recipes)
             available_tools: Optional list of available tools in OpenAI format
+            agent_discovery_context: Optional agent discovery context string
+                                    (from format_agent_discovery_context)
         """
         lines: list[str] = []
+
+        # Add agent discovery context first (other agents available)
+        if agent_discovery_context:
+            lines.append(agent_discovery_context.rstrip())
+            lines.append("")
 
         # Add tool instructions if tools are available
         if available_tools:

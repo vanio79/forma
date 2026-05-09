@@ -1,6 +1,6 @@
 /** API client for Forma Web UI */
 
-import type { Stats, RequestListItem, RequestFullDetail, Upstream, ChatMessage, ChatCompletionResponse, ToolEvent } from "./types";
+import type { Stats, RequestListItem, RequestFullDetail, Upstream, ChatMessage, ChatCompletionResponse, ToolEvent, AgentEvent, Agent } from "./types";
 
 const API_BASE = "/ui";
 const CHAT_API_BASE = "/v1";
@@ -118,6 +118,7 @@ export async function deleteUpstream(upstreamId: string): Promise<{ status: stri
  * @param onChunk - Callback for each chunk of content
  * @param onReasoningChunk - Callback for each chunk of reasoning content (optional)
  * @param onToolEvent - Callback for tool execution events (optional)
+ * @param onAgentEvent - Callback for agent start/end events (optional)
  * @param onComplete - Callback when stream completes
  * @param onError - Callback for errors
  */
@@ -128,7 +129,8 @@ export async function streamChatCompletion(
   onComplete: () => void,
   onError: (error: string) => void,
   onReasoningChunk?: (chunk: string) => void,
-  onToolEvent?: (event: ToolEvent) => void
+  onToolEvent?: (event: ToolEvent) => void,
+  onAgentEvent?: (event: AgentEvent) => void
 ): Promise<void> {
   const response = await fetch(`${CHAT_API_BASE}/chat/completions`, {
     method: "POST",
@@ -180,9 +182,43 @@ export async function streamChatCompletion(
           continue;
         }
 
+        // Check for agent markers in raw lines (not wrapped in data:)
+        if (line.includes("__AGENT_START__") || line.includes("__AGENT_END__")) {
+          const agentStartRegex = /__AGENT_START__(.+?)__END__/g;
+          const agentEndRegex = /__AGENT_END__(.+?)__END__/g;
+          let match;
+
+          // Parse agent start markers
+          while ((match = agentStartRegex.exec(line)) !== null) {
+            try {
+              const eventData = JSON.parse(match[1]) as AgentEvent;
+              eventData.type = "agent_start";
+              if (onAgentEvent) {
+                onAgentEvent(eventData);
+              }
+            } catch {
+              // Ignore parse errors for agent events
+            }
+          }
+
+          // Parse agent end markers
+          while ((match = agentEndRegex.exec(line)) !== null) {
+            try {
+              const eventData = JSON.parse(match[1]) as AgentEvent;
+              eventData.type = "agent_end";
+              if (onAgentEvent) {
+                onAgentEvent(eventData);
+              }
+            } catch {
+              // Ignore parse errors for agent events
+            }
+          }
+          continue;  // Skip further processing for marker lines
+        }
+
         if (line.startsWith("data: ")) {
           const data = line.slice(6).trim();
-          
+
           if (data === "[DONE]") {
             onComplete();
             return;
@@ -192,12 +228,44 @@ export async function streamChatCompletion(
             const parsed = JSON.parse(data);
             const content = parsed.choices?.[0]?.delta?.content;
             const reasoningContent = parsed.choices?.[0]?.delta?.reasoning_content;
-            
+
             if (content) {
-              // Check for tool event markers
-              const toolEventRegex = /__TOOL_EVENT__(.+?)__END__/g;
+              // Check for agent markers inside content (legacy fallback)
+              const agentStartRegex = /__AGENT_START__(.+?)__END__/g;
+              const agentEndRegex = /__AGENT_END__(.+?)__END__/g;
               let match;
               let remainingContent = content;
+              
+              // Parse agent start markers
+              while ((match = agentStartRegex.exec(content)) !== null) {
+                try {
+                  const eventData = JSON.parse(match[1]) as AgentEvent;
+                  eventData.type = "agent_start";
+                  if (onAgentEvent) {
+                    onAgentEvent(eventData);
+                  }
+                } catch {
+                  // Ignore parse errors for agent events
+                }
+                remainingContent = remainingContent.replace(match[0], "");
+              }
+              
+              // Parse agent end markers
+              while ((match = agentEndRegex.exec(content)) !== null) {
+                try {
+                  const eventData = JSON.parse(match[1]) as AgentEvent;
+                  eventData.type = "agent_end";
+                  if (onAgentEvent) {
+                    onAgentEvent(eventData);
+                  }
+                } catch {
+                  // Ignore parse errors for agent events
+                }
+                remainingContent = remainingContent.replace(match[0], "");
+              }
+              
+              // Check for tool event markers
+              const toolEventRegex = /__TOOL_EVENT__(.+?)__END__/g;
               
               while ((match = toolEventRegex.exec(content)) !== null) {
                 // Parse the tool event JSON
@@ -213,7 +281,7 @@ export async function streamChatCompletion(
                 remainingContent = remainingContent.replace(match[0], "");
               }
               
-              // Send remaining content (without tool event markers)
+              // Send remaining content (without agent or tool event markers)
               // Don't trim - spaces are valid content
               if (remainingContent) {
                 onChunk(remainingContent);
@@ -266,5 +334,83 @@ export async function nonStreamingChatCompletion(
     throw new Error(errorData.detail || `API error: ${response.status}`);
   }
 
+  return response.json();
+}
+
+// === Agent Management ===
+
+export async function getAgents(): Promise<{ agents: Agent[] }> {
+  return fetchJSON<{ agents: Agent[] }>(`${API_BASE}/agents`);
+}
+
+export async function getAgent(agentId: string): Promise<{ agent: Agent }> {
+  return fetchJSON<{ agent: Agent }>(`${API_BASE}/agents/${agentId}`);
+}
+
+export async function createAgent(params: {
+  name: string;
+  purpose: string;
+  instruction_prompt: string;
+  upstream_id?: string;
+  tools_enabled?: boolean;
+  tool_whitelist?: string[];
+  max_iterations?: number;
+  is_enabled?: boolean;
+}): Promise<{ status: string; message: string; agent: Agent }> {
+  const query = new URLSearchParams();
+  query.set("name", params.name);
+  query.set("purpose", params.purpose);
+  query.set("instruction_prompt", params.instruction_prompt);
+  if (params.upstream_id) query.set("upstream_id", params.upstream_id);
+  if (params.tools_enabled !== undefined) query.set("tools_enabled", params.tools_enabled ? "true" : "false");
+  if (params.tool_whitelist) query.set("tool_whitelist", JSON.stringify(params.tool_whitelist));
+  if (params.max_iterations !== undefined) query.set("max_iterations", params.max_iterations.toString());
+  if (params.is_enabled !== undefined) query.set("is_enabled", params.is_enabled ? "true" : "false");
+  
+  const response = await fetch(`${API_BASE}/agents?${query.toString()}`, { method: "POST" });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({ detail: "Unknown error" }));
+    throw new Error(errorData.detail || `API error: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function updateAgent(
+  agentId: string,
+  params: {
+    name?: string;
+    purpose?: string;
+    instruction_prompt?: string;
+    upstream_id?: string;
+    tools_enabled?: boolean;
+    tool_whitelist?: string[];
+    max_iterations?: number;
+    is_enabled?: boolean;
+  }
+): Promise<{ status: string; message: string; agent: Agent }> {
+  const query = new URLSearchParams();
+  if (params.name) query.set("name", params.name);
+  if (params.purpose) query.set("purpose", params.purpose);
+  if (params.instruction_prompt) query.set("instruction_prompt", params.instruction_prompt);
+  if (params.upstream_id !== undefined) query.set("upstream_id", params.upstream_id);
+  if (params.tools_enabled !== undefined) query.set("tools_enabled", params.tools_enabled ? "true" : "false");
+  if (params.tool_whitelist !== undefined) query.set("tool_whitelist", JSON.stringify(params.tool_whitelist));
+  if (params.max_iterations !== undefined) query.set("max_iterations", params.max_iterations.toString());
+  if (params.is_enabled !== undefined) query.set("is_enabled", params.is_enabled ? "true" : "false");
+  
+  const response = await fetch(`${API_BASE}/agents/${agentId}?${query.toString()}`, { method: "PUT" });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({ detail: "Unknown error" }));
+    throw new Error(errorData.detail || `API error: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function deleteAgent(agentId: string): Promise<{ status: string; message: string }> {
+  const response = await fetch(`${API_BASE}/agents/${agentId}`, { method: "DELETE" });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({ detail: "Unknown error" }));
+    throw new Error(errorData.detail || `API error: ${response.status}`);
+  }
   return response.json();
 }

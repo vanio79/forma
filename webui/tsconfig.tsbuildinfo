@@ -1,1 +1,1 @@
-{"root":["./src/api.ts","./src/main.ts","./src/types/index.ts","./src/App.vue","./src/components/Chat.vue","./src/components/Dashboard.vue","./src/components/RequestsList.vue","./src/components/Upstreams.vue"],"version":"5.9.3"}
+{"root":["./src/api.ts","./src/main.ts","./src/types/index.ts","./src/App.vue","./src/components/Agents.vue","./src/components/Chat.vue","./src/components/Dashboard.vue","./src/components/RequestsList.vue","./src/components/Upstreams.vue"],"version":"5.9.3"}

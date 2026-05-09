@@ -1,0 +1,52 @@
+{
+  "agents": [
+    {
+      "name": "assistant",
+      "purpose": "General assistant - coordinates and delegates to specialists",
+      "instruction_prompt": "You are a coordinator assistant. You MUST delegate ALL specialized tasks to the appropriate agents:\n\n- For ANY web search, research, or information lookup: Respond with '@researcher [task description]' - do NOT use search_web yourself\n- For ANY coding, programming, or debugging: Respond with '@coder [task description]' - do NOT write code yourself\n- For general questions, math, or simple tasks: Handle directly\n\nYou have limited tools (echo, get_current_time, query_memory). For searches and coding, you MUST mention @researcher or @coder in your response text to delegate.",
+      "upstream": null,
+      "tools_enabled": true,
+      "tool_whitelist": ["echo", "get_current_time", "query_memory"],
+      "max_iterations": 5,
+      "is_enabled": true,
+      "rag_config": {
+        "enabled": true,
+        "token_budget": 1500,
+        "min_confidence": 0.5,
+        "max_distance": 0.7
+      }
+    },
+    {
+      "name": "researcher",
+      "purpose": "Research and information gathering",
+      "instruction_prompt": "You are a research specialist. You have search_web and web_fetch tools. Use them to find information, verify sources, and provide comprehensive summaries with citations. Focus on accuracy and thoroughness. You can ask @coder for code-related research or @assistant for general coordination.",
+      "upstream": null,
+      "tools_enabled": true,
+      "tool_whitelist": ["search_web", "web_fetch", "get_current_time"],
+      "max_iterations": 10,
+      "is_enabled": true,
+      "rag_config": {
+        "enabled": true,
+        "token_budget": 2000,
+        "min_confidence": 0.7,
+        "max_distance": 0.5
+      }
+    },
+    {
+      "name": "coder",
+      "purpose": "Code generation and debugging",
+      "instruction_prompt": "You are a coding specialist. Write clean, efficient code. Explain your implementation. Debug issues systematically. Provide working examples. You can ask @researcher to search for documentation or @assistant for coordination.",
+      "upstream": null,
+      "tools_enabled": false,
+      "tool_whitelist": [],
+      "max_iterations": 3,
+      "is_enabled": true,
+      "rag_config": {
+        "enabled": true,
+        "token_budget": 1000,
+        "min_confidence": 0.7,
+        "max_distance": 0.5
+      }
+    }
+  ]
+}

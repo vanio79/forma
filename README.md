@@ -110,6 +110,60 @@ Example: Client sends `{"model": "gemma-local"}` → Forma routes to configured 
 
 Upstreams are configured via the Web UI and stored in the Forma database, not in config files.
 
+### Multi-Agent System
+
+Forma includes a multi-agent architecture where specialized AI agents can discover each other and communicate through mention-based routing:
+
+**Features:**
+- **Agent Discovery**: Each request is augmented with information about available agents
+- **Mention-Based Routing**: Route messages to specific agents using `@agent_name` syntax
+- **Agent-to-Agent Delegation**: Agents can delegate tasks to other agents (max depth = 3)
+- **Streaming Support**: Multi-agent responses stream with agent markers
+- **Global Shared Memory**: All agents query the same RAG indexes with different retrieval configs
+
+**Default Agents** (configured in `config/agents.json`):
+- **@assistant**: General coordinator - delegates to specialists
+- **@researcher**: Research specialist - web search, information gathering (tools: search_web, web_fetch)
+- **@coder**: Code specialist - code generation, debugging (no tools)
+
+**Example Usage:**
+
+```python
+# Direct agent routing
+response = client.chat.completions.create(
+    model="gemma-local",
+    messages=[{"role": "user", "content": "@researcher Find Python async tutorials"}]
+)
+# Response from @researcher with web search results
+
+# Multi-agent delegation
+response = client.chat.completions.create(
+    model="gemma-local",
+    messages=[{"role": "user", "content": "@researcher find quantum computing papers, @coder explain them"}]
+)
+# Sequential: researcher → coder
+```
+
+**Agent Configuration:**
+
+Each agent has:
+- `name`: Agent identifier (used in @mentions)
+- `purpose`: Role description shown in discovery context
+- `instruction_prompt`: System prompt for this agent
+- `upstream`: Model configuration (null = use request's model)
+- `tools_enabled`: Whether agent can use tools
+- `tool_whitelist`: Specific tools this agent can access
+- `max_iterations`: Tool iteration limit
+- `rag_config`: RAG retrieval settings (enabled, token_budget, min_confidence, max_distance)
+
+**Important Notes:**
+- **NO Broadcast**: The system does NOT support `@all` broadcast - all routing is mention-based
+- **Shared Memory**: All agents query the SAME global indexes (facts_index, recipes_index)
+- **Agent-Specific RAG**: Each agent has different retrieval thresholds via rag_config
+- **Web UI**: Manage agents at `http://localhost:8000/agents`
+
+See `docs/multi_agent_design.md` for detailed architecture and implementation documentation.
+
 ### Storage Architecture
 
 Forma uses **GrafitoDB** - a SQLite-backed database that combines graph and vector storage in a single file:
@@ -139,14 +193,15 @@ score = confidence × similarity × time_decay
 
 ## Web UI
 
-Forma includes a Vue 3 SPA Web UI for visualizing requests, extractions, retrievals, managing upstreams, and interactive chat:
+Forma includes a Vue 3 SPA Web UI for visualizing requests, extractions, retrievals, managing upstreams, agents, and interactive chat:
 
 - **Dashboard**: Overview of system activity
 - **Requests List**: Browse recent requests with detailed information
 - **Extractions View**: See relationships, facts, and recipes extracted from each request
 - **Retrievals View**: See context retrieved for augmentation with confidence and scores
 - **Upstreams**: Configure upstream API endpoints with model name mapping
-- **Chat**: Interactive chat interface with streaming responses and automatic context compaction
+- **Agents**: Manage multi-agent configurations (create, edit, delete, view discovery info)
+- **Chat**: Interactive chat interface with streaming responses, agent routing, and automatic context compaction
 
 Access the Web UI at: `http://localhost:8000`
 
@@ -171,6 +226,9 @@ The Chat page (`http://localhost:8000/chat`) provides an interactive chat experi
 
 **Features:**
 - **Streaming Responses**: Assistant responses stream in real-time, showing content as it's generated
+- **Agent Routing**: Use `@agent_name` syntax to route messages to specific agents
+  - Example: `@researcher Find information about quantum computing`
+  - Responses tagged with agent name: `[@researcher] ...`
 - **Real-Time Tool Execution**: When tools are used, execution events stream immediately:
   - Tool call starts are shown before execution completes
   - Progress indicators display during tool execution
@@ -182,6 +240,12 @@ The Chat page (`http://localhost:8000/chat`) provides an interactive chat experi
 - **Token Tracking**: Real-time token count display with visual progress bar
 - **Auto-Focus**: Input field automatically focuses after responses complete, allowing immediate typing of the next message
 - **Context Size Control**: Adjustable context window size (256-128000 tokens)
+
+**Agent Routing Display:**
+When routing to agents, the UI shows:
+- 🤖 **Agent indicator** with agent name and purpose
+- **Agent execution** with their specific tools and responses
+- **Multi-agent** responses displayed sequentially with separators
 
 **Tool Execution Display:**
 When the model uses tools (e.g., searching the web), the UI shows:
@@ -426,6 +490,12 @@ curl -X POST http://localhost:8000/admin/clear
 | `PUT /ui/upstreams/{id}` | Update upstream |
 | `DELETE /ui/upstreams/{id}` | Delete upstream |
 | `POST /ui/upstreams/reload` | Reload upstreams from database |
+| `GET /ui/agents` | Get all agent configurations |
+| `POST /ui/agents` | Create new agent |
+| `GET /ui/agents/{id}` | Get specific agent |
+| `PUT /ui/agents/{id}` | Update agent |
+| `DELETE /ui/agents/{id}` | Delete agent |
+| `POST /ui/agents/reload` | Reload agents from config file |
 
 **Chat Feature Types:**
 The Chat interface uses specific TypeScript types defined in `webui/src/types/index.ts`:
@@ -585,11 +655,19 @@ forma/
 │   ├── main.py              # FastAPI application entry point
 │   ├── config.py            # Configuration management
 │   ├── extractor.py         # Relationship/fact/recipe extraction
-│   ├── storage.py           # GrafitoDB storage backend
-│   ├── forma_db.py          # Forma database (upstreams + request history)
+│   ├── storage.py           # GrafitoDB storage backend (global RAG methods)
+│   ├── forma_db.py          # Forma database (upstreams, agents, request history)
 │   ├── upstream_manager.py  # Multi-upstream routing
-│   ├── api.py               # Web UI API endpoints
+│   ├── api.py               # Web UI API endpoints (upstreams + agents)
 │   ├── proxy.py             # OpenAI API proxy with upstream routing
+│   ├── agents/              # Multi-agent system
+│   │   ├── __init__.py      # Agent exports
+│   │   ├── registry.py      # AgentRegistry (CRUD operations)
+│   │   ├── discovery.py     # Agent discovery context formatting
+│   │   ├── parser.py        # Parse agent mentions (RoutingType: MENTION, EXPLICIT)
+│   │   ├── router.py        # AgentRouter (mention-based routing only)
+│   │   ├── orchestrator.py  # Multi-agent orchestration (sequential)
+│   │   └── config_loader.py # Load agents from config/agents.json
 │   ├── tools/               # Server-side tool execution
 │   │   ├── __init__.py      # Tool exports
 │   │   ├── base.py          # Tool base classes (Tool, ToolCall, ToolResult)
@@ -604,6 +682,8 @@ forma/
 │   │       └── memory.py    # GrafitoDB query tool
 │   └── prompts/
 │       └── extraction.txt   # Extraction prompt template
+├── config/
+│   └── agents.json          # Agent configurations (assistant, researcher, coder)
 ├── webui/                   # Vue 3 SPA frontend
 │   ├── src/
 │   │   ├── components/
@@ -611,24 +691,26 @@ forma/
 │   │   │   ├── RequestsList.vue
 │   │   │   ├── RequestDetail.vue
 │   │   │   ├── Upstreams.vue
-│   │   │   └── Chat.vue      # Interactive chat with streaming & real-time tools
-│   │   ├── api.ts           # API client (includes streaming with tool event parsing)
-│   │   ├── types/           # TypeScript types (includes ChatMessage, ToolEvent types)
+│   │   │   ├── Agents.vue     # Agent management UI
+│   │   │   └── Chat.vue       # Interactive chat with agent routing & streaming
+│   │   ├── api.ts           # API client (includes streaming with agent markers)
+│   │   ├── types/           # TypeScript types (Agent, ChatMessage, ToolEvent)
 │   │   └── main.ts
 │   ├── package.json
 │   └ vite.config.ts
 ├── webui_dist/              # Built frontend (served by FastAPI)
 ├── data/                    # Forma database
-│   └── forma.db             # Upstreams + request history
+│   └── forma.db             # Upstreams, agents, request history
 ├── grafito_data/            # GrafitoDB database
-│   └── forma.db             # Entity nodes, relationships, facts, recipes
+│   └── forma.db             # Global indexes: facts_index, recipes_index
 ├── models/                  # Cached embedding models
 ├── logs/                    # Runtime logs
 │   ├── extractions.jsonl
 │   ├── retrievals.jsonl
 │   └ server.log
 ├── docs/                    # Documentation
-│   └── tool_calling_design.md
+│   ├── multi_agent_design.md # Multi-agent system architecture
+│   └── tool_calling_design.md # Tool execution design
 └── benchmarks/              # LongMemEval benchmark
 ```
 

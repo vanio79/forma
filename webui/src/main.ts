@@ -5,12 +5,14 @@ import Dashboard from "./components/Dashboard.vue";
 import RequestsList from "./components/RequestsList.vue";
 import Upstreams from "./components/Upstreams.vue";
 import Chat from "./components/Chat.vue";
+import Agents from "./components/Agents.vue";
 
 const routes = [
   { path: "/", name: "Dashboard", component: Dashboard },
   { path: "/requests", name: "RequestsList", component: RequestsList },
   { path: "/upstreams", name: "Upstreams", component: Upstreams },
   { path: "/chat", name: "Chat", component: Chat },
+  { path: "/agents", name: "Agents", component: Agents },
 ];
 
 const router = createRouter({
