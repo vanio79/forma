@@ -60,27 +60,34 @@ Client receives final response (fully resolved)
 
 **Real-Time Streaming Architecture:**
 
-Tool execution events are streamed to the client using SSE (Server-Sent Events) with special markers:
+Tool execution events are streamed to the client using SSE (Server-Sent Events) with semantic blocks:
 
 ```
-Tool Start Event → sent immediately when tool call begins
+[TOOL_START: search_web]
+id: call_abc123
+args: {"query": "Python async"}
+[/TOOL_START]
     │ (50ms delay to ensure delivery before execution)
     ▼
 Tool Execution (e.g., web search ~1-2 seconds)
     │
     ▼
-Tool End Event → sent immediately when execution completes
+[TOOL_END: search_web]
+id: call_abc123
+status: success
+duration_ms: 1200
+result: Found 5 results...
+[/TOOL_END]
 ```
 
-Events use the marker format: `__TOOL_EVENT__{json}__END__` for UI parsing.
+The frontend uses a **two-pass parser**: first pass extracts raw semantic blocks (AGENT_START/END, EVALUATION, SUMMARY, TOOL blocks), second pass parses JSON SSE data for content streaming.
 
 **Event Types:**
-- `tool_loop_progress` - Iteration count (only when tools are used)
-- `tool_calls_received` - List of tools the model wants to call
-- `tool_call_start` - Individual tool starting execution
-- `tool_call_end` - Individual tool completed (with result preview)
+- `TOOL_START` / `TOOL_END` - Individual tool execution (sent as raw text blocks)
+- `AGENT_START` / `AGENT_END` - Agent response boundaries with call chain info
+- `EVALUATION` - Meta-agent evaluation result with status, confidence, retry guidance
+- `SUMMARY` - Summarizer output with compacted subagent context
 - `tool_loop_complete` - All tool iterations finished (control signal)
-- `eval_event` - Meta-agent evaluation notifications (evaluation_start, evaluation_result, retry_attempt)
 
 Enable tools in `.env`:
 ```env
@@ -189,12 +196,27 @@ When evaluation returns `incomplete`, the system automatically retries with:
 - Progressive refinement across attempts
 
 **SSE Streaming of Evaluation:**
-Evaluation events are streamed to the client in real-time:
+Evaluation events are streamed as semantic blocks:
 ```
-__EVAL_EVENT__{"type": "evaluation_start", "subagent": "researcher"}__END__
-__EVAL_EVENT__{"type": "evaluation_result", "status": "incomplete", "reason": "..."}__END__
-__EVAL_EVENT__{"type": "retry_attempt", "attempt": 2, "max_attempts": 10}__END__
+[AGENT_END: researcher]
+depth: 1
+chain: assistant → researcher
+[/AGENT_END]
+
+[EVALUATION: researcher]
+status: incomplete
+confidence: 50%
+reason: Need full recipe details
+retry_instructions: Use web_fetch to get article content
+[/EVALUATION]
+
+[AGENT_START: researcher]
+depth: 1
+chain: assistant → researcher
+[/AGENT_START]
 ```
+
+The frontend parses these blocks and displays them as standalone evaluation boxes.
 
 **Context Compaction:**
 When agent-to-agent conversations grow large, automatic compaction triggers at 90% of the context window:
@@ -272,13 +294,17 @@ The Chat page (`http://localhost:8000/chat`) provides an interactive chat experi
 
 **Features:**
 - **Streaming Responses**: Assistant responses stream in real-time, showing content as it's generated
+- **Markdown Rendering**: All agent responses render markdown (headers, lists, code blocks, tables, links)
 - **Agent Routing**: Use `@agent_name` syntax to route messages to specific agents
   - Example: `@researcher Find information about quantum computing`
-  - Responses tagged with agent name: `[@researcher] ...`
-- **Real-Time Tool Execution**: When tools are used, execution events stream immediately:
-  - Tool call starts are shown before execution completes
-  - Progress indicators display during tool execution
-  - Expandable tool results show full output after completion
+  - Agent call chain shown in message headers: `🤖 @assistant → @researcher`
+- **Real-Time Tool Execution**: Tools appear as separate blue boxes with live status:
+  - Tool name, arguments, and execution status
+  - Duration in milliseconds
+  - Result preview (truncated to 200 chars, expandable)
+- **Evaluation Boxes**: Subagent evaluations appear as yellow boxes with status, confidence, and retry guidance
+- **Summary Boxes**: Summarizer output appears as blue boxes with structured content
+- **Activity Indicator**: Three bouncing dots appear during silent periods between events
 - **Context Compaction**: When token usage reaches 95% of the configured context size, older messages are automatically summarized
   - Summary appears at the end of the chat and remains visible
   - Keeps the most recent messages (last 4 messages = 2 exchanges)
@@ -287,32 +313,36 @@ The Chat page (`http://localhost:8000/chat`) provides an interactive chat experi
 - **Auto-Focus**: Input field automatically focuses after responses complete, allowing immediate typing of the next message
 - **Context Size Control**: Adjustable context window size (256-128000 tokens)
 
-**Agent Routing Display:**
-When routing to agents, the UI shows:
-- 🤖 **Agent indicator** with agent name and purpose
-- **Agent execution** with their specific tools and responses
-- **Multi-agent** responses displayed sequentially with separators
+**Message Types:**
+The chat UI displays several message roles:
+- **User** (blue bubble, right-aligned)
+- **Assistant** (white bubble with agent chain header)
+- **Tool** (blue box: `🔧 search_web 120ms`)
+- **Evaluation** (yellow box: `⚠ Evaluation @researcher 50% confidence`)
+- **Summary** (blue box: `📝 Summary @researcher`)
+- **System** (orange box: `📝 Context Summary`)
 
 **Tool Execution Display:**
-When the model uses tools (e.g., searching the web), the UI shows:
-- 🔧 **Tool call indicator** with execution count and time
-- **Expandable details** showing:
-  - Tool name and arguments
-  - Execution status (success/failed)
-  - Duration in milliseconds
-  - Full result preview
+When the model uses tools, each tool call gets its own standalone box:
+- Sent as `[TOOL_START: name]` / `[TOOL_END: name]` semantic blocks
+- Box shows tool name, arguments, status icon, and duration
+- Failed tools show red error styling
+- Agent call chain is shown above the tool box
 
-This real-time feedback lets users see what's happening during long-running operations like web searches (~1-2 seconds), rather than waiting until completion.
+**Evaluation Display:**
+After subagent execution completes, the evaluator's assessment appears:
+- Status: complete ✓ / incomplete ⚠ / failed ✗
+- Confidence percentage
+- Reason for the evaluation
+- Retry instructions (if incomplete)
 
-**Context Compaction Details:**
-When context reaches the threshold, Forma:
-1. Analyzes messages to summarize (messages older than the last 2 exchanges)
-2. Generates a summary using streaming (visible as it's generated)
-3. Displays summary with "📝 Context Summary" label at the end of the chat
-4. Removes summarized messages, keeping recent context
-5. Resets token count to reflect the compacted state
+**Summary Display:**
+Before returning to the calling agent, the summarizer compacts subagent output:
+- Semi-structured format with sections (Original Task, Key Findings, Data, Conclusions)
+- Preserves all relevant details (names, dates, URLs, numbers)
+- Shown as a separate blue box above the final assistant response
 
-This approach (similar to OpenCode) ensures conversations can continue indefinitely without losing important context from earlier exchanges.
+This rich visual feedback lets users see the full agent pipeline: delegation → tools → evaluation → summary → response.
 
 ### Request Detail Sections
 
@@ -553,11 +583,15 @@ The Chat interface uses specific TypeScript types defined in `webui/src/types/in
 | `TokenUsage` | Token count information from API responses |
 
 The `ChatMessage` type includes:
-- `role`: "user", "assistant", or "system"
-- `content`: Message text
+- `role`: "user", "assistant", "system", "tool", "evaluation", "summary"
+- `content`: Message text (rendered as markdown for assistant/evaluation/summary)
 - `timestamp`: Unix timestamp
 - `isStreaming`: Flag for messages being streamed
 - `isCompacting`: Flag for compaction progress messages
+- `agentName` / `agentChain`: Agent routing information
+- `toolName` / `toolStatus` / `toolResult`: Tool execution details
+- `evalStatus` / `evalReason` / `evalConfidence`: Evaluation results
+- `summaryAgent`: Summarized subagent name
 
 ## Extraction
 
@@ -641,7 +675,9 @@ cd webui && npm run build
 
 **Web UI Development Notes:**
 - The Chat component (`webui/src/components/Chat.vue`) implements streaming using Server-Sent Events (SSE)
-- Streaming updates use Vue's reactivity by modifying array elements by index: `messages.value[index].content += chunk`
+- **Two-pass SSE parser** (`api.ts`): First pass extracts raw semantic blocks (AGENT/TOOL/EVALUATION/SUMMARY), second pass parses JSON SSE data
+- Tool/agent/eval/summary events create separate message boxes in the message array
+- Markdown rendering uses `marked` + `DOMPurify` with `:deep()` selectors for scoped style penetration
 - Context compaction triggers at 95% of configured context size
 - Auto-focus after responses uses `nextTick()` and `inputTextarea.value?.focus()`
 

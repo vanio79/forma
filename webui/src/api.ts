@@ -1,9 +1,9 @@
 /** API client for Forma Web UI */
 
-import type { Stats, RequestListItem, RequestFullDetail, Upstream, ChatMessage, ChatCompletionResponse, ToolEvent, AgentEvent, Agent } from "./types";
+import type { Stats, RequestListItem, RequestFullDetail, Upstream, ChatMessage, ChatCompletionResponse, ToolEvent, AgentEvent, EvaluationEvent, SummaryEvent, Agent } from "./types";
 
 const API_BASE = "/ui";
-const CHAT_API_BASE = "/v1";
+const CHAT_API_BASE = "/v1";  // Use vite proxy
 
 async function fetchJSON<T>(url: string): Promise<T> {
   const response = await fetch(url);
@@ -108,6 +108,200 @@ export async function deleteUpstream(upstreamId: string): Promise<{ status: stri
   return response.json();
 }
 
+// === Semantic Block Parser ===
+
+/**
+ * Parse semantic blocks from text content.
+ * 
+ * Semantic blocks are human-readable markers:
+ * [BLOCK_TYPE: name]
+ * key: value
+ * [/BLOCK_TYPE]
+ */
+function parseSemanticBlocks(text: string): Array<{ type: string; name: string; data: Record<string, string>; raw: string }> {
+  const blocks: Array<{ type: string; name: string; data: Record<string, string>; raw: string }> = [];
+  
+  // Regex to match [TYPE: name]...[/TYPE] blocks
+  // Handles both single-line and multi-line content
+  const blockRegex = /\[(\w+)(?:\s*:\s*([^\]]+))?\]([\s\S]*?)\[\/\1\]/g;
+  
+  let match;
+  while ((match = blockRegex.exec(text)) !== null) {
+    const blockType = match[1];
+    const blockName = match[2]?.trim() || "";
+    const blockContent = match[3].trim();
+    const rawBlock = match[0];
+    
+    // Parse key: value pairs from block content
+    const data: Record<string, string> = {};
+    const lines = blockContent.split('\n');
+    for (const line of lines) {
+      const colonIndex = line.indexOf(':');
+      if (colonIndex > 0) {
+        const key = line.slice(0, colonIndex).trim();
+        const value = line.slice(colonIndex + 1).trim();
+        if (key && value) {
+          data[key] = value;
+        }
+      }
+    }
+    
+    blocks.push({
+      type: blockType,
+      name: blockName,
+      data,
+      raw: rawBlock,
+    });
+  }
+  
+  return blocks;
+}
+
+/**
+ * Convert a parsed semantic block to a ToolEvent.
+ */
+function blockToToolEvent(block: { type: string; name: string; data: Record<string, string>; raw: string }): ToolEvent | null {
+  const timestamp = parseFloat(block.data.timestamp || "0") || Date.now();
+  
+  if (block.type === "TOOL_START") {
+    return {
+      type: "tool_call_start",
+      timestamp,
+      id: block.data.id || "",
+      name: block.name,
+      arguments: block.data.args ? JSON.parse(block.data.args) : {},
+    };
+  }
+  
+  if (block.type === "TOOL_END") {
+    const success = block.data.status === "success";
+    return {
+      type: "tool_call_end",
+      timestamp,
+      id: block.data.id || "",
+      name: block.name,
+      success,
+      duration_ms: parseFloat(block.data.duration?.replace("ms", "") || "0"),
+      result_preview: block.data.result,
+    };
+  }
+  
+  if (block.type === "TOOL_LOOP_COMPLETE") {
+    return {
+      type: "tool_loop_complete",
+      timestamp,
+      total_tool_calls: parseInt(block.data.total_calls || "0"),
+      total_tool_time_ms: parseFloat(block.data.total_time?.replace("ms", "") || "0"),
+    };
+  }
+  
+  if (block.type === "TOOL_PROGRESS") {
+    const [iteration, max] = (block.data.iteration || "0/0").split("/").map(n => parseInt(n.trim()));
+    return {
+      type: "tool_loop_progress",
+      timestamp,
+      iteration: iteration || 0,
+      max_iterations: max || 0,
+    };
+  }
+  
+  if (block.type === "TOOL_CALLS_RECEIVED") {
+    const toolsList = block.data.tools?.split(",").map(t => t.trim()) || [];
+    return {
+      type: "tool_calls_received",
+      timestamp,
+      count: parseInt(block.data.count || "0"),
+      tools: toolsList.map(name => ({ name, arguments: {} })),
+    };
+  }
+  
+  return null;
+}
+
+/**
+ * Convert a parsed semantic block to an AgentEvent.
+ */
+function blockToAgentEvent(block: { type: string; name: string; data: Record<string, string>; raw: string }): AgentEvent | null {
+  const timestamp = Date.now();
+  
+  if (block.type === "AGENT_START") {
+    const depth = parseInt(block.data.depth || "0");
+    const chain = block.data.chain?.split(" → ").map(a => a.trim()) || [block.name];
+    return {
+      type: "agent_start",
+      timestamp,
+      agent: block.name,
+      depth,
+      chain,
+    };
+  }
+  
+  if (block.type === "AGENT_END") {
+    const depth = parseInt(block.data.depth || "0");
+    const chain = block.data.chain?.split(" → ").map(a => a.trim()) || [block.name];
+    return {
+      type: "agent_end",
+      timestamp,
+      agent: block.name,
+      depth,
+      chain,
+    };
+  }
+  
+  return null;
+}
+
+/**
+ * Convert a parsed semantic block to an EvaluationEvent.
+ */
+function blockToEvaluationEvent(block: { type: string; name: string; data: Record<string, string>; raw: string }): EvaluationEvent | null {
+  if (block.type === "EVALUATION") {
+    const confidenceStr = block.data.confidence?.replace("%", "") || "0";
+    const confidence = parseFloat(confidenceStr) / 100;  // Convert percentage to decimal
+    
+    return {
+      type: "evaluation_result",
+      timestamp: Date.now(),
+      agent: block.name,
+      status: block.data.status as "complete" | "incomplete" | "failed",
+      reason: block.data.reason,
+      confidence,
+      retry_instructions: block.data.retry_instructions,
+    };
+  }
+  
+  return null;
+}
+
+/**
+ * Convert a parsed semantic block to a SummaryEvent.
+ * 
+ * NOTE: We extract content from block.raw because parseSemanticBlocks'
+ * key:value parser only captures the first line of multi-line values.
+ * This keeps the backend format human-readable for non-parsing frontends.
+ */
+function blockToSummaryEvent(block: { type: string; name: string; data: Record<string, string>; raw: string }): SummaryEvent | null {
+  if (block.type === "SUMMARY") {
+    // Extract everything between the opening [SUMMARY: name] and closing [/SUMMARY] tags
+    const contentMatch = block.raw.match(/\[SUMMARY:[^\]]*\]\n?([\s\S]*?)\n?\[\/SUMMARY\]/);
+    let content = contentMatch ? contentMatch[1].trim() : block.data.content || "";
+    
+    // Strip the "content:" prefix if present (backend adds it for consistency)
+    if (content.startsWith("content:")) {
+      content = content.slice(8).trim();
+    }
+    
+    return {
+      type: "summary_result",
+      timestamp: Date.now(),
+      agent: block.name,
+      content,
+    };
+  }
+  
+  return null;
+}
+
 // === Chat ===
 
 /**
@@ -119,6 +313,8 @@ export async function deleteUpstream(upstreamId: string): Promise<{ status: stri
  * @param onReasoningChunk - Callback for each chunk of reasoning content (optional)
  * @param onToolEvent - Callback for tool execution events (optional)
  * @param onAgentEvent - Callback for agent start/end events (optional)
+ * @param onEvaluationEvent - Callback for evaluation events (optional)
+ * @param onSummaryEvent - Callback for summary events (optional)
  * @param onComplete - Callback when stream completes
  * @param onError - Callback for errors
  */
@@ -130,7 +326,9 @@ export async function streamChatCompletion(
   onError: (error: string) => void,
   onReasoningChunk?: (chunk: string) => void,
   onToolEvent?: (event: ToolEvent) => void,
-  onAgentEvent?: (event: AgentEvent) => void
+  onAgentEvent?: (event: AgentEvent) => void,
+  onEvaluationEvent?: (event: EvaluationEvent) => void,
+  onSummaryEvent?: (event: SummaryEvent) => void
 ): Promise<void> {
   const response = await fetch(`${CHAT_API_BASE}/chat/completions`, {
     method: "POST",
@@ -169,7 +367,45 @@ export async function streamChatCompletion(
 
       buffer += decoder.decode(value, { stream: true });
       
-      // Process SSE events
+      // FIRST PASS: Parse raw semantic blocks that are sent directly (not wrapped in JSON)
+      // AGENT_START/END and EVALUATION blocks are sent as raw text, not in SSE JSON
+      // So we parse them from the raw buffer first
+      const rawBlocks = parseSemanticBlocks(buffer);
+      
+      if (rawBlocks.length > 0) {
+        // Process each semantic block found
+        for (const block of rawBlocks) {
+          // Only process AGENT and EVALUATION events in first pass
+          // TOOL events come wrapped in SSE JSON, so they're processed in second pass
+          
+          // Process agent events (AGENT_START/END are sent as raw text)
+          const agentEvent = blockToAgentEvent(block);
+          if (agentEvent && onAgentEvent) {
+            onAgentEvent(agentEvent);
+          }
+          
+          // Process evaluation events (EVALUATION blocks are sent as raw text)
+          const evalEvent = blockToEvaluationEvent(block);
+          if (evalEvent && onEvaluationEvent) {
+            onEvaluationEvent(evalEvent);
+          }
+          
+          // Process summary events (SUMMARY blocks are sent as raw text)
+          const summaryEvent = blockToSummaryEvent(block);
+          if (summaryEvent && onSummaryEvent) {
+            onSummaryEvent(summaryEvent);
+          }
+          
+          // Only remove block from buffer if it's NOT a TOOL block
+          // (TOOL blocks are inside JSON and will be removed in second pass)
+          if (!block.type.startsWith('TOOL_')) {
+            buffer = buffer.replace(block.raw, "");
+          }
+        }
+      }
+      
+      // SECOND PASS: Process SSE events (line-by-line)
+      // This is where TOOL events come from (wrapped in JSON content)
       const lines = buffer.split("\n");
       buffer = ""; // Reset buffer, will add back incomplete line
 
@@ -182,38 +418,9 @@ export async function streamChatCompletion(
           continue;
         }
 
-        // Check for agent markers in raw lines (not wrapped in data:)
-        if (line.includes("__AGENT_START__") || line.includes("__AGENT_END__")) {
-          const agentStartRegex = /__AGENT_START__(.+?)__END__/g;
-          const agentEndRegex = /__AGENT_END__(.+?)__END__/g;
-          let match;
-
-          // Parse agent start markers
-          while ((match = agentStartRegex.exec(line)) !== null) {
-            try {
-              const eventData = JSON.parse(match[1]) as AgentEvent;
-              eventData.type = "agent_start";
-              if (onAgentEvent) {
-                onAgentEvent(eventData);
-              }
-            } catch {
-              // Ignore parse errors for agent events
-            }
-          }
-
-          // Parse agent end markers
-          while ((match = agentEndRegex.exec(line)) !== null) {
-            try {
-              const eventData = JSON.parse(match[1]) as AgentEvent;
-              eventData.type = "agent_end";
-              if (onAgentEvent) {
-                onAgentEvent(eventData);
-              }
-            } catch {
-              // Ignore parse errors for agent events
-            }
-          }
-          continue;  // Skip further processing for marker lines
+        // Skip empty lines
+        if (!line.trim()) {
+          continue;
         }
 
         if (line.startsWith("data: ")) {
@@ -230,61 +437,48 @@ export async function streamChatCompletion(
             const reasoningContent = parsed.choices?.[0]?.delta?.reasoning_content;
 
             if (content) {
-              // Check for agent markers inside content (legacy fallback)
-              const agentStartRegex = /__AGENT_START__(.+?)__END__/g;
-              const agentEndRegex = /__AGENT_END__(.+?)__END__/g;
-              let match;
-              let remainingContent = content;
+              // Check for semantic blocks inside content
+              const blocks = parseSemanticBlocks(content);
               
-              // Parse agent start markers
-              while ((match = agentStartRegex.exec(content)) !== null) {
-                try {
-                  const eventData = JSON.parse(match[1]) as AgentEvent;
-                  eventData.type = "agent_start";
-                  if (onAgentEvent) {
-                    onAgentEvent(eventData);
+              if (blocks.length > 0) {
+                let remainingContent = content;
+                
+                for (const block of blocks) {
+                  // Process agent events
+                  const agentEvent = blockToAgentEvent(block);
+                  if (agentEvent && onAgentEvent) {
+                    onAgentEvent(agentEvent);
                   }
-                } catch {
-                  // Ignore parse errors for agent events
-                }
-                remainingContent = remainingContent.replace(match[0], "");
-              }
-              
-              // Parse agent end markers
-              while ((match = agentEndRegex.exec(content)) !== null) {
-                try {
-                  const eventData = JSON.parse(match[1]) as AgentEvent;
-                  eventData.type = "agent_end";
-                  if (onAgentEvent) {
-                    onAgentEvent(eventData);
+                  
+                  // Process tool events
+                  const toolEvent = blockToToolEvent(block);
+                  if (toolEvent && onToolEvent) {
+                    onToolEvent(toolEvent);
                   }
-                } catch {
-                  // Ignore parse errors for agent events
-                }
-                remainingContent = remainingContent.replace(match[0], "");
-              }
-              
-              // Check for tool event markers
-              const toolEventRegex = /__TOOL_EVENT__(.+?)__END__/g;
-              
-              while ((match = toolEventRegex.exec(content)) !== null) {
-                // Parse the tool event JSON
-                try {
-                  const eventData = JSON.parse(match[1]) as ToolEvent;
-                  if (onToolEvent) {
-                    onToolEvent(eventData);
+                  
+                  // Process evaluation events
+                  const evalEvent = blockToEvaluationEvent(block);
+                  if (evalEvent && onEvaluationEvent) {
+                    onEvaluationEvent(evalEvent);
                   }
-                } catch {
-                  // Ignore parse errors for tool events
+                  
+                  // Process summary events
+                  const summaryEvent = blockToSummaryEvent(block);
+                  if (summaryEvent && onSummaryEvent) {
+                    onSummaryEvent(summaryEvent);
+                  }
+                  
+                  // Remove the block from content
+                  remainingContent = remainingContent.replace(block.raw, "");
                 }
-                // Remove the marker from remaining content
-                remainingContent = remainingContent.replace(match[0], "");
-              }
-              
-              // Send remaining content (without agent or tool event markers)
-              // Don't trim - spaces are valid content
-              if (remainingContent) {
-                onChunk(remainingContent);
+                
+                // Send remaining content (without semantic blocks)
+                if (remainingContent.trim()) {
+                  onChunk(remainingContent);
+                }
+              } else {
+                // No semantic blocks, just send the content
+                onChunk(content);
               }
             }
             

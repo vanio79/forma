@@ -50,13 +50,27 @@ Client Request (stream: true)
 
 ### Event Marker Format
 
-Events are embedded in SSE content using special markers for UI parsing:
+Tool events are sent as **semantic blocks** in the raw SSE stream:
 
 ```
-__TOOL_EVENT__{"type": "tool_call_start", ...}__END__
+[TOOL_START: search_web]
+id: call_abc123
+args: {"query": "Python async tutorials"}
+[/TOOL_START]
 ```
 
-This format allows standard OpenAI clients to receive events as content deltas, while Forma's UI parses them separately.
+After tool execution completes:
+
+```
+[TOOL_END: search_web]
+id: call_abc123
+status: success
+duration_ms: 1250
+result: Found 5 results...
+[/TOOL_END]
+```
+
+This human-readable format works with any OpenAI-compatible client (non-parsing clients simply display the raw text), while Forma's UI extracts the blocks for structured display.
 
 ### SSE Flush Mechanism
 
@@ -506,27 +520,36 @@ Forma executes tools with real-time event streaming
 ┌─────────────────────────────────────┐
 │ SSE Stream to Client                │
 │                                     │
-│  [Tool events stream as they occur] │
-│                                     │
-│  __TOOL_EVENT__{...}__END__         │
+│  [TOOL_START: search_web]           │ ← Raw semantic block
+│  id: call_abc123                    │
+│  args: {"query": "..."}             │
+│  [/TOOL_START]                      │
 │  : flush                            │ ← Forces HTTP buffering to flush
 │                                     │
-│  [Tool executes]                    │
+│  [Tool executes ~1-2 seconds]       │
 │                                     │
-│  __TOOL_EVENT__{...}__END__         │
+│  [TOOL_END: search_web]             │ ← Raw semantic block
+│  id: call_abc123                    │
+│  status: success                    │
+│  duration_ms: 1250                  │
+│  result: Found 5 results...         │
+│  [/TOOL_END]                        │
 │  : flush                            │
 │                                     │
-│  [Final response streams normally]  │
+│  data: {"choices": [...]}           │ ← JSON SSE content
+│  data: {"choices": [...]}           │
 │                                     │
 └─────────────────────────────────────┘
 ```
 
 **Key implementation details:**
 
-1. **Async Queue Pattern**: Tool executor puts events into an `asyncio.Queue`, streaming generator reads them with `get_nowait()` + 1ms sleep
-2. **SSE Flush Comments**: Send `: flush\n\n` after each event chunk to force HTTP buffering to release
-3. **Event Loop Yield**: `await asyncio.sleep(0)` after yielding chunk ensures immediate I/O
-4. **Start Event Delay**: 50ms delay after `tool_call_start` ensures delivery before execution begins
+1. **Semantic Block Format**: Tool/agent/eval/summary events sent as `[TYPE: name]...[/TYPE]` raw text blocks, not embedded in JSON
+2. **Two-Pass Frontend Parser**: First pass extracts raw semantic blocks, second pass parses JSON SSE data for content
+3. **Async Queue Pattern**: Tool executor puts events into an `asyncio.Queue`, streaming generator reads them with `get_nowait()` + 1ms sleep
+4. **SSE Flush Comments**: Send `: flush\n\n` after each event chunk to force HTTP buffering to release
+5. **Event Loop Yield**: `await asyncio.sleep(0)` after yielding chunk ensures immediate I/O
+6. **Start Event Delay**: 50ms delay after `tool_call_start` ensures delivery before execution begins
 
 **Benefits:**
 - Users see tool progress immediately, not after completion
@@ -537,18 +560,30 @@ Forma executes tools with real-time event streaming
 
 ```typescript
 interface ToolEvent {
-  type: 'tool_loop_progress' | 'tool_calls_received' | 
-        'tool_call_start' | 'tool_call_end' | 'tool_loop_complete';
+  type: 'tool_call_start' | 'tool_call_end' | 'tool_loop_complete';
   timestamp: number;
   // ...type-specific fields
 }
 ```
 
-- `tool_loop_progress`: Iteration number (only when tools are found)
-- `tool_calls_received`: List of tools being called
 - `tool_call_start`: Individual tool starting (sent BEFORE execution)
 - `tool_call_end`: Individual tool completed (sent AFTER execution)
 - `tool_loop_complete`: All iterations done (control signal, always sent)
+
+**Block format:**
+```
+[TOOL_START: search_web]
+id: call_abc123
+args: {"query": "..."}
+[/TOOL_START]
+
+[TOOL_END: search_web]
+id: call_abc123
+status: success
+duration_ms: 1250
+result: Found 5 results...
+[/TOOL_END]
+```
 
 ### Non-Streaming Requests
 
@@ -660,51 +695,78 @@ async def chat_completions(request: Request) -> Response:
 
 ### Tool Call Visualization
 
-The Chat component shows real-time tool execution:
+The Chat component shows each tool call as a **standalone message box**:
 
 ```typescript
-interface ToolCallInfo {
-  id: string;
-  name: string;
-  arguments: Record<string, unknown>;
-  status: 'pending' | 'running' | 'success' | 'failed';
-  result?: string;
-  error?: string;
-  duration_ms?: number;
-}
-
-interface ToolExecutionState {
-  toolCalls: ToolCallInfo[];
-  totalTimeMs: number;
-  isComplete: boolean;
-}
-
 interface ChatMessage {
-  // ...existing fields
-  toolExecution?: ToolExecutionState;
-  toolExecutionExpanded?: boolean;
+  role: "tool";
+  content: "";
+  toolName: string;
+  toolCallId: string;
+  toolStatus: "pending" | "running" | "success" | "failed";
+  toolDuration?: number;
+  toolArgs?: Record<string, unknown>;
+  toolResult?: string;
+  agentChain?: string[];  // Inherited from parent agent
 }
 ```
 
 **Display logic:**
-- Tool execution box only shown when `toolCalls.length > 0`
-- Progress shown during execution with expandable results
-- Summary shows total calls and time after completion
+- Each `TOOL_START` event creates a new tool message (appended to message array)
+- `TOOL_END` updates the existing message with status, duration, and result
+- Tool box shows: icon (●/✓/✗), name, duration, args, result preview
+- Agent call chain shown above the tool box: `🤖 @assistant → @researcher`
+- Failed tools show red styling; successful tools show green
+
+**Message flow in UI:**
+```
+[User message]
+  ↓
+[🤖 @assistant → @researcher]  (agent header)
+[🔧 search_web  850ms]         (tool box)
+  ↓
+[🤖 @assistant → @researcher]  (agent header)
+[Assistant response content]
+```
 
 ### SSE Parsing
 
-The API client parses tool events from SSE content:
+The API client uses a **two-pass parser** for semantic blocks:
 
 ```typescript
 // webui/src/api.ts
-const toolEventRegex = /__TOOL_EVENT__(\{[^}]+\})__END__/g;
 
-// Extract tool events from content chunks
-for (const match of chunk.matchAll(toolEventRegex)) {
-  const eventData = JSON.parse(match[1]);
-  // Update toolExecution state based on event type
+// First pass: extract raw semantic blocks from buffer
+const blockRegex = /\[(\w+)(?:\s*:\s*([^\]]+))?\]([\s\S]*?)\[\/\1\]/g;
+
+// Process tool blocks
+const toolEvent = blockToToolEvent(block);
+if (toolEvent) onToolEvent(toolEvent);
+
+// Process agent blocks  
+const agentEvent = blockToAgentEvent(block);
+if (agentEvent) onAgentEvent(agentEvent);
+
+// Second pass: parse JSON SSE lines for content
+for (const line of lines) {
+  if (line.startsWith("data: ")) {
+    const parsed = JSON.parse(line.slice(6));
+    // Check for tool events embedded in content
+    const content = parsed.choices?.[0]?.delta?.content;
+    if (content) {
+      const toolBlocks = parseSemanticBlocks(content);
+      for (const block of toolBlocks) {
+        const toolEvent = blockToToolEvent(block);
+        if (toolEvent) onToolEvent(toolEvent);
+      }
+    }
+  }
 }
 ```
+
+**Key difference from old format:**
+- Old: `__TOOL_EVENT__{json}__END__` embedded in JSON content
+- New: `[TOOL_START: name]...[/TOOL_START]` as raw text blocks outside JSON
 
 ### Tool Configuration - Planned
 

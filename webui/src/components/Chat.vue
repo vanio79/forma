@@ -77,7 +77,7 @@
                   <div v-if="msg.content" class="streaming-summary">
                     <div class="streaming-summary-label">📝 Summary:</div>
                     <div class="streaming-summary-text">
-                      {{ msg.content }}
+                      <span v-html="renderMarkdown(msg.content)"></span>
                       <span class="streaming-indicator"></span>
                     </div>
                   </div>
@@ -91,10 +91,78 @@
                   <span class="system-summary-label">📝 Context Summary</span>
                   <span class="system-summary-time">{{ formatTime(msg.timestamp ?? Date.now()) }}</span>
                 </div>
-                <div class="system-summary-content">{{ msg.content }}</div>
+                <div class="system-summary-content" v-html="renderMarkdown(msg.content)"></div>
               </div>
             </template>
           </template>
+
+          <!-- Tool messages - standalone boxes for each tool call -->
+          <template v-else-if="msg.role === 'tool'">
+            <div v-if="msg.agentChain && msg.agentChain.length > 0" class="message-header">
+              <span class="message-role">🤖 @{{ msg.agentChain.join(' → @') }}</span>
+            </div>
+            <div :class="['tool-message-box', msg.toolStatus]">
+              <div class="tool-message-header">
+                <span class="tool-message-icon">
+                  <template v-if="msg.toolStatus === 'running'">●</template>
+                  <template v-else-if="msg.toolStatus === 'success'">✓</template>
+                  <template v-else>✗</template>
+                </span>
+                <span class="tool-message-name">{{ msg.toolName }}</span>
+                <span v-if="msg.toolStatus === 'running'" class="tool-spinner"></span>
+                <span v-if="msg.toolDuration" class="tool-message-duration">{{ msg.toolDuration.toFixed(1) }}ms</span>
+              </div>
+              <div v-if="msg.toolArgs && Object.keys(msg.toolArgs).length > 0" class="tool-message-args">
+                {{ JSON.stringify(msg.toolArgs) }}
+              </div>
+              <div v-if="msg.toolResult && msg.toolStatus === 'success'" class="tool-message-result">
+                {{ msg.toolResult.length > 200 ? msg.toolResult.slice(0, 200) + '...' : msg.toolResult }}
+              </div>
+              <div v-if="msg.toolStatus === 'failed'" class="tool-message-error">
+                Tool execution failed
+              </div>
+            </div>
+          </template>
+
+          <!-- Evaluation messages - show evaluation results from subagent -->
+          <template v-else-if="msg.role === 'evaluation'">
+            <div v-if="msg.agentChain && msg.agentChain.length > 0" class="message-header">
+              <span class="message-role">🤖 @{{ msg.agentChain.join(' → @') }}</span>
+            </div>
+            <div :class="['evaluation-message-box', msg.evalStatus]">
+              <div class="evaluation-message-header">
+                <span class="evaluation-message-icon">
+                  <template v-if="msg.evalStatus === 'complete'">✓</template>
+                  <template v-else-if="msg.evalStatus === 'incomplete'">⚠</template>
+                  <template v-else>✗</template>
+                </span>
+                <span class="evaluation-message-label">Evaluation</span>
+                <span v-if="msg.evalConfidence" class="evaluation-message-confidence">
+                  {{ (msg.evalConfidence * 100).toFixed(0) }}% confidence
+                </span>
+              </div>
+              <div v-if="msg.evalReason" class="evaluation-message-reason" v-html="renderMarkdown(msg.evalReason)"></div>
+              <div v-if="msg.evalRetryInstructions && msg.evalStatus === 'incomplete'" class="evaluation-message-retry">
+                <span class="retry-label">Retry instructions:</span>
+                <span v-html="renderMarkdown(msg.evalRetryInstructions)"></span>
+              </div>
+            </div>
+          </template>
+
+          <!-- Summary messages - show summarizer results from subagent -->
+          <template v-else-if="msg.role === 'summary'">
+            <div v-if="msg.agentChain && msg.agentChain.length > 0" class="message-header">
+              <span class="message-role">🤖 @{{ msg.agentChain.join(' → @') }}</span>
+            </div>
+            <div class="summary-message-box">
+              <div class="summary-message-header">
+                <span class="summary-message-icon">📝</span>
+                <span class="summary-message-label">Summary</span>
+              </div>
+              <div v-if="msg.content" class="summary-message-content" v-html="renderMarkdown(msg.content)"></div>
+            </div>
+          </template>
+
           <!-- Regular user/assistant messages -->
           <template v-else>
             <div class="message-header">
@@ -121,85 +189,21 @@
                 <span class="toggle-label">💭 Reasoning</span>
                 <span v-if="msg.isStreaming" class="streaming-indicator-small"></span>
               </button>
-              <div v-if="msg.showReasoning" class="reasoning-content">
-                {{ msg.reasoning }}
-              </div>
-            </div>
-            
-            <!-- Tool execution section (show during tool calling) -->
-            <div v-if="msg.toolExecution && !msg.toolExecution.isComplete && msg.toolExecution.toolCalls.length > 0" class="tool-execution-section">
-              <div class="tool-execution-header">
-                <span class="tool-execution-label">🔧 Tool Execution</span>
-                <span class="tool-iteration">Iteration {{ msg.toolExecution.iteration }}/{{ msg.toolExecution.maxIterations }}</span>
-              </div>
-              <div class="tool-calls-list">
-                <div v-for="(call, callIdx) in msg.toolExecution.toolCalls" :key="callIdx" :class="['tool-call-item', call.status]">
-                  <div class="tool-call-header">
-                    <span class="tool-call-icon">
-                      {{ call.status === 'pending' ? '○' : call.status === 'running' ? '●' : call.status === 'success' ? '✓' : '✗' }}
-                    </span>
-                    <span class="tool-call-name">{{ call.name }}</span>
-                    <span v-if="call.status === 'running'" class="tool-spinner"></span>
-                    <span v-if="call.duration_ms" class="tool-call-duration">{{ call.duration_ms.toFixed(1) }}ms</span>
-                    <button 
-                      v-if="call.result && call.status === 'success'" 
-                      class="tool-expand-btn"
-                      @click="toggleToolResult(call)"
-                    >
-                      {{ call.expanded ? '▼' : '▶' }}
-                    </button>
-                  </div>
-                  <div v-if="call.arguments && Object.keys(call.arguments).length > 0" class="tool-call-args">
-                    {{ JSON.stringify(call.arguments) }}
-                  </div>
-                  <div v-if="call.expanded && call.result" class="tool-call-result-full">
-                    {{ call.result }}
-                  </div>
-                  <div v-if="!call.expanded && call.result && call.status === 'success'" class="tool-call-result-preview">
-                    {{ call.result.length > 100 ? call.result.slice(0, 100) + '...' : call.result }}
-                  </div>
-                  <div v-if="call.error && call.status === 'failed'" class="tool-call-error">
-                    {{ call.error }}
-                  </div>
-                </div>
-              </div>
-            </div>
-            
-            <!-- Tool execution summary (after completion) -->
-            <div v-if="msg.toolExecution && msg.toolExecution.isComplete && msg.toolExecution.toolCalls.length > 0" class="tool-execution-summary">
-              <div class="tool-summary-header">
-                <span class="tool-summary-label">🔧 Tools completed: {{ msg.toolExecution.toolCalls.length }} calls in {{ msg.toolExecution.totalTimeMs.toFixed(1) }}ms</span>
-                <button class="tool-expand-btn" @click="toggleToolExecution(msg)">
-                  {{ msg.toolExecutionExpanded ? '▼' : '▶' }}
-                </button>
-              </div>
-              <div v-if="msg.toolExecutionExpanded" class="tool-summary-details">
-                <div v-for="(call, callIdx) in msg.toolExecution.toolCalls" :key="callIdx" :class="['tool-call-item', call.status]">
-                  <div class="tool-call-header">
-                    <span class="tool-call-icon">
-                      {{ call.status === 'success' ? '✓' : '✗' }}
-                    </span>
-                    <span class="tool-call-name">{{ call.name }}</span>
-                    <span v-if="call.duration_ms" class="tool-call-duration">{{ call.duration_ms.toFixed(1) }}ms</span>
-                  </div>
-                  <div v-if="call.arguments && Object.keys(call.arguments).length > 0" class="tool-call-args">
-                    {{ JSON.stringify(call.arguments) }}
-                  </div>
-                  <div v-if="call.result && call.status === 'success'" class="tool-call-result-full">
-                    {{ call.result }}
-                  </div>
-                  <div v-if="call.error && call.status === 'failed'" class="tool-call-error">
-                    {{ call.error }}
-                  </div>
-                </div>
-              </div>
+              <div v-if="msg.showReasoning" class="reasoning-content" v-html="renderMarkdown(msg.reasoning)"></div>
             </div>
             
             <div class="message-content">
-              {{ msg.content }}
+              <span v-html="renderMarkdown(msg.content)"></span>
               <span v-if="msg.isStreaming && !msg.reasoning" class="streaming-indicator"></span>
             </div>
           </template>
+        </div>
+
+        <!-- Activity indicator shown while waiting for next event/message -->
+        <div v-if="isStreaming && !isCompacting" class="activity-indicator">
+          <span class="activity-dot"></span>
+          <span class="activity-dot"></span>
+          <span class="activity-dot"></span>
         </div>
       </div>
 
@@ -236,7 +240,9 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, nextTick } from "vue";
-import type { Upstream, ChatMessage, ToolEvent, ToolExecutionState, ToolCallInfo, AgentEvent } from "../types";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
+import type { Upstream, ChatMessage, ToolEvent, AgentEvent, EvaluationEvent, SummaryEvent } from "../types";
 import { getUpstreams, streamChatCompletion } from "../api";
 
 const upstreams = ref<Upstream[]>([]);
@@ -254,15 +260,6 @@ const messagesContainer = ref<HTMLElement | null>(null);
 const isCompacting = ref(false);
 const compactionStep = ref(0);  // 0: not started, 1: analyzing, 2: generating, 3: applying
 const compactionMessage = ref("");
-
-// Tool execution state
-const toolExecutionState = ref<ToolExecutionState>({
-  iteration: 0,
-  maxIterations: 5,
-  toolCalls: [],
-  isComplete: false,
-  totalTimeMs: 0,
-});
 
 // Agent tracking state
 const currentAgent = ref<string | null>(null);  // Which agent is currently responding
@@ -300,6 +297,13 @@ function formatTime(timestamp: number): string {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+// Render markdown to safe HTML
+function renderMarkdown(text: string | undefined): string {
+  if (!text) return "";
+  const rawHtml = marked.parse(text, { async: false }) as string;
+  return DOMPurify.sanitize(rawHtml);
+}
+
 // Auto-scroll to bottom
 function scrollToBottom() {
   nextTick(() => {
@@ -323,56 +327,41 @@ function buildSummarizationMessages(messagesToSummarize: ChatMessage[]): ChatMes
   ];
 }
 
-// Tool event handler - updates tool execution state
+// Track tool message indices for updates
+const toolMessageIndices = ref<Record<string, number>>({});  // toolCallId -> message index
+
+// Tool event handler - creates/updates separate tool messages
 function handleToolEvent(event: ToolEvent): void {
-  const state = toolExecutionState.value;
-  
-  if (event.type === "tool_loop_progress") {
-    state.iteration = event.iteration ?? 0;
-    state.maxIterations = event.max_iterations ?? 5;
-  } else if (event.type === "tool_calls_received") {
-    // Add new tool calls to state
-    if (event.tools) {
-      for (const tool of event.tools) {
-        const existingCall = state.toolCalls.find(c => c.name === tool.name);
-        if (!existingCall) {
-          state.toolCalls.push({
-            id: `call_${tool.name}_${state.toolCalls.length}`,
-            name: tool.name,
-            arguments: tool.arguments ?? {},
-            status: "pending",
-            expanded: false,
-          });
-        }
-      }
+  if (event.type === "tool_call_start" && event.name && event.id) {
+    // Create a new tool message for this call - append to end
+    const toolMsg: ChatMessage = {
+      role: "tool",
+      content: "",
+      timestamp: Date.now(),
+      isStreaming: true,
+      toolName: event.name,
+      toolCallId: event.id,
+      toolStatus: "running",
+      toolArgs: event.arguments,
+    };
+    
+    messages.value.push(toolMsg);
+    toolMessageIndices.value[event.id] = messages.value.length - 1;
+    
+  } else if (event.type === "tool_call_end" && event.name && event.id) {
+    // Update the existing tool message with result
+    const msgIndex = toolMessageIndices.value[event.id];
+    if (msgIndex !== undefined && messages.value[msgIndex]) {
+      messages.value[msgIndex].isStreaming = false;
+      messages.value[msgIndex].toolStatus = event.success ? "success" : "failed";
+      messages.value[msgIndex].toolDuration = event.duration_ms;
+      messages.value[msgIndex].toolResult = event.result_preview;
+      messages.value[msgIndex].timestamp = Date.now();
     }
-  } else if (event.type === "tool_call_start") {
-    // Mark tool as running
-    const call = state.toolCalls.find(c => c.name === event.name);
-    if (call) {
-      call.status = "running";
-    } else if (event.name) {
-      // Add if not already tracked
-      state.toolCalls.push({
-        id: event.id ?? `call_${event.name}`,
-        name: event.name,
-        arguments: event.arguments ?? {},
-        status: "running",
-        expanded: false,
-      });
-    }
-  } else if (event.type === "tool_call_end") {
-    // Mark tool as complete
-    const call = state.toolCalls.find(c => c.name === event.name);
-    if (call) {
-      call.status = event.success ? "success" : "failed";
-      call.duration_ms = event.duration_ms;
-      call.result = event.result_preview;
-      call.error = event.success ? undefined : event.result_preview;
-    }
+    
   } else if (event.type === "tool_loop_complete") {
-    state.isComplete = true;
-    state.totalTimeMs = event.total_tool_time_ms ?? 0;
+    // All tools done - clear indices for next round
+    toolMessageIndices.value = {};
   }
   
   scrollToBottom();
@@ -384,6 +373,19 @@ function handleAgentEvent(event: AgentEvent): void {
     // Agent is starting - create a NEW message for this agent
     currentAgent.value = event.agent;
     agentResponses.value[event.agent] = "";
+
+    const chain = event.chain ?? [event.agent];
+    const depth = event.depth ?? 0;
+
+    // Retroactively set chain on recent tool messages that don't have one.
+    // Tools arrive before AGENT_START, so they were created without context.
+    for (let i = messages.value.length - 1; i >= 0; i--) {
+      const msg = messages.value[i];
+      if (msg.role !== "tool") break;
+      if (msg.agentChain) break;
+      msg.agentChain = chain;
+      msg.agentDepth = depth;
+    }
     
     // Create a new message for this agent
     const agentMsg: ChatMessage = {
@@ -394,9 +396,8 @@ function handleAgentEvent(event: AgentEvent): void {
       isStreaming: true,
       showReasoning: true,
       agentName: event.agent,
-      agentChain: event.chain,  // Store the delegation chain
-      toolExecution: event.depth === 0 ? toolExecutionState.value : undefined,  // Only track tools for top-level agent
-      toolExecutionExpanded: false,
+      agentChain: chain,
+      agentDepth: depth,
     };
     messages.value.push(agentMsg);
     agentMessageIndices.value[event.agent] = messages.value.length - 1;
@@ -408,12 +409,6 @@ function handleAgentEvent(event: AgentEvent): void {
       messages.value[msgIndex].isStreaming = false;
       messages.value[msgIndex].timestamp = Date.now();
       
-      // If this agent had tool calls, mark tool execution as complete
-      if (toolExecutionState.value.toolCalls.length > 0 && event.depth === 0) {
-        toolExecutionState.value.isComplete = true;
-        messages.value[msgIndex].toolExecution = toolExecutionState.value;
-      }
-      
       // Hide reasoning section if empty
       if (!messages.value[msgIndex].reasoning) {
         messages.value[msgIndex].showReasoning = false;
@@ -423,6 +418,56 @@ function handleAgentEvent(event: AgentEvent): void {
   }
   
   scrollToBottom();
+}
+
+// Helper: find the call chain for an agent by looking at recent assistant messages
+function findAgentChain(agentName: string | undefined): string[] | undefined {
+  if (!agentName) return undefined;
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    const msg = messages.value[i];
+    if (msg.role === "assistant" && msg.agentName === agentName && msg.agentChain) {
+      return msg.agentChain;
+    }
+  }
+  return undefined;
+}
+
+// Evaluation event handler - creates separate messages for evaluation results
+function handleEvaluationEvent(event: EvaluationEvent): void {
+  if (event.type === "evaluation_result") {
+    const chain = findAgentChain(event.agent);
+    const evalMsg: ChatMessage = {
+      role: "evaluation",
+      content: "",
+      timestamp: Date.now(),
+      evalStatus: event.status,
+      evalAgent: event.agent,
+      evalReason: event.reason,
+      evalConfidence: event.confidence,
+      evalRetryInstructions: event.retry_instructions,
+      agentChain: chain,
+      agentName: event.agent,
+    };
+    messages.value.push(evalMsg);
+    scrollToBottom();
+  }
+}
+
+// Summary event handler - creates separate messages for summarizer results
+function handleSummaryEvent(event: SummaryEvent): void {
+  if (event.type === "summary_result") {
+    const chain = findAgentChain(event.agent);
+    const summaryMsg: ChatMessage = {
+      role: "summary",
+      content: event.content || "",
+      timestamp: Date.now(),
+      summaryAgent: event.agent,
+      agentChain: chain,
+      agentName: event.agent,
+    };
+    messages.value.push(summaryMsg);
+    scrollToBottom();
+  }
 }
 
 // Compaction: summarize and replace old messages when context is 95% full (like OpenCode)
@@ -546,19 +591,11 @@ async function sendMessage(): Promise<void> {
 
   error.value = "";
 
-  // Reset tool execution state for new message
-  toolExecutionState.value = {
-    iteration: 0,
-    maxIterations: 5,
-    toolCalls: [],
-    isComplete: false,
-    totalTimeMs: 0,
-  };
-
   // Reset agent state for new message
   currentAgent.value = null;
   agentResponses.value = {};
   agentMessageIndices.value = {};
+  toolMessageIndices.value = {};
 
   // Add user message
   const userMsg: ChatMessage = {
@@ -599,8 +636,6 @@ async function sendMessage(): Promise<void> {
             timestamp: Date.now(),
             isStreaming: true,
             showReasoning: true,
-            toolExecution: toolExecutionState.value,
-            toolExecutionExpanded: false,
           };
           messages.value.push(fallbackMsg);
           agentMessageIndices.value["fallback"] = messages.value.length - 1;
@@ -627,11 +662,6 @@ async function sendMessage(): Promise<void> {
           // Hide reasoning section if empty
           if (!msg.reasoning) {
             msg.showReasoning = false;
-          }
-          
-          // Mark tool execution as complete if there were tool calls
-          if (msg.toolExecution && msg.toolExecution.toolCalls.length > 0) {
-            msg.toolExecution.isComplete = true;
           }
         });
         
@@ -690,19 +720,21 @@ async function sendMessage(): Promise<void> {
         scrollToBottom();
       },
       (toolEvent: ToolEvent) => {
-        // Handle tool execution events
+        // Handle tool execution events - creates separate tool messages
         handleToolEvent(toolEvent);
-        // Update the tool execution state on the current agent's message
-        const currentAgentName = currentAgent.value || "fallback";
-        const msgIndex = agentMessageIndices.value[currentAgentName];
-        if (msgIndex !== undefined && messages.value[msgIndex]) {
-          messages.value[msgIndex].toolExecution = toolExecutionState.value;
-        }
       },
       (agentEvent: AgentEvent) => {
         // Handle agent start/end events
         hasReceivedAgentStart = true;
         handleAgentEvent(agentEvent);
+      },
+      (evaluationEvent: EvaluationEvent) => {
+        // Handle evaluation result events - creates separate evaluation messages
+        handleEvaluationEvent(evaluationEvent);
+      },
+      (summaryEvent: SummaryEvent) => {
+        // Handle summary result events - creates separate summary messages
+        handleSummaryEvent(summaryEvent);
       }
     );
   } catch (e) {
@@ -716,16 +748,6 @@ async function sendMessage(): Promise<void> {
 // Toggle reasoning visibility
 function toggleReasoning(msg: ChatMessage): void {
   msg.showReasoning = !msg.showReasoning;
-}
-
-// Toggle tool result expansion
-function toggleToolResult(call: ToolCallInfo): void {
-  call.expanded = !call.expanded;
-}
-
-// Toggle full tool execution details
-function toggleToolExecution(msg: ChatMessage): void {
-  msg.toolExecutionExpanded = !msg.toolExecutionExpanded;
 }
 
 // Clear chat
@@ -869,6 +891,15 @@ onMounted(loadUpstreams);
   background-color: white;
   color: #2c3e50;
   border: 1px solid #e2e8f0;
+  font-size: 0.9rem;
+}
+
+/* Agent-related messages (assistant, tool, eval, summary) use smaller font */
+.message.assistant,
+.message.tool,
+.message.evaluation,
+.message.summary {
+  font-size: 0.9rem;
 }
 
 .message.system {
@@ -910,7 +941,7 @@ onMounted(loadUpstreams);
   color: #744210;
   font-size: 0.9rem;
   line-height: 1.5;
-  white-space: pre-wrap;
+  white-space: normal;
 }
 
 .compaction-progress {
@@ -995,7 +1026,7 @@ onMounted(loadUpstreams);
   font-size: 0.9rem;
   color: #744210;
   line-height: 1.5;
-  white-space: pre-wrap;
+  white-space: normal;
   word-wrap: break-word;
 }
 
@@ -1026,7 +1057,7 @@ onMounted(loadUpstreams);
 .message-content {
   padding: 0.75rem 1rem;
   border-radius: 8px;
-  white-space: pre-wrap;
+  white-space: normal;
   word-wrap: break-word;
 }
 
@@ -1075,7 +1106,7 @@ onMounted(loadUpstreams);
   border-top: 1px solid #e2e8f0;
   font-size: 0.85rem;
   color: #4a5568;
-  white-space: pre-wrap;
+  white-space: normal;
   word-wrap: break-word;
   line-height: 1.5;
 }
@@ -1364,5 +1395,409 @@ onMounted(loadUpstreams);
   border-radius: 4px;
   margin-top: 0.5rem;
   font-size: 0.85rem;
+}
+
+/* Activity indicator shown between messages while streaming */
+.activity-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.75rem 1rem;
+  margin-left: 0.5rem;
+}
+
+.activity-dot {
+  width: 6px;
+  height: 6px;
+  background-color: #a0aec0;
+  border-radius: 50%;
+  animation: typing-bounce 1.4s infinite ease-in-out both;
+}
+
+.activity-dot:nth-child(1) {
+  animation-delay: -0.32s;
+}
+
+.activity-dot:nth-child(2) {
+  animation-delay: -0.16s;
+}
+
+@keyframes typing-bounce {
+  0%, 80%, 100% {
+    transform: scale(0);
+    opacity: 0.4;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Tool message box styles (standalone tool messages) */
+.message.tool {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.tool-message-box {
+  background-color: #e6f7ff;
+  border: 1px solid #91d5ff;
+  border-radius: 8px;
+  padding: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.tool-message-box.running {
+  border-color: #ffc53d;
+  background-color: #fffbe6;
+}
+
+.tool-message-box.failed {
+  border-color: #ff4d4f;
+  background-color: #fff2f0;
+}
+
+.tool-message-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 500;
+  color: #096dd9;
+}
+
+.tool-message-box.running .tool-message-header {
+  color: #d48806;
+}
+
+.tool-message-box.failed .tool-message-header {
+  color: #cf1322;
+}
+
+.tool-message-icon {
+  font-size: 0.9rem;
+}
+
+.tool-message-name {
+  flex: 1;
+}
+
+.tool-message-duration {
+  font-size: 0.75rem;
+  color: #8c8c8c;
+}
+
+.tool-message-args {
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  color: #595959;
+  background-color: #f0f0f0;
+  padding: 0.5rem;
+  border-radius: 4px;
+  font-family: monospace;
+  overflow-x: auto;
+}
+
+.tool-message-result {
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  color: #52c41a;
+  background-color: #f6ffed;
+  padding: 0.5rem;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.tool-message-error {
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  color: #ff4d4f;
+  background-color: #fff2f0;
+  padding: 0.5rem;
+  border-radius: 4px;
+}
+
+/* Evaluation message box styles */
+.message.evaluation {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.evaluation-message-box {
+  background-color: #fffbe6;
+  border: 1px solid #ffd591;
+  border-radius: 8px;
+  padding: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.evaluation-message-box.complete {
+  background-color: #f6ffed;
+  border-color: #b7eb8f;
+}
+
+.evaluation-message-box.failed {
+  background-color: #fff2f0;
+  border-color: #ffa39e;
+}
+
+.evaluation-message-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.evaluation-message-icon {
+  font-size: 1rem;
+}
+
+.evaluation-message-box.complete .evaluation-message-icon {
+  color: #389e0d;
+}
+
+.evaluation-message-box.incomplete .evaluation-message-icon {
+  color: #d48806;
+}
+
+.evaluation-message-box.failed .evaluation-message-icon {
+  color: #ff4d4f;
+}
+
+.evaluation-message-label {
+  font-weight: 600;
+  color: #d48806;
+}
+
+.evaluation-message-box.complete .evaluation-message-label {
+  color: #389e0d;
+}
+
+.evaluation-message-box.failed .evaluation-message-label {
+  color: #cf1322;
+}
+
+.evaluation-message-confidence {
+  color: #8c8c8c;
+  font-size: 0.75rem;
+  margin-left: auto;
+}
+
+.evaluation-message-reason {
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  color: #595959;
+  background-color: #fafafa;
+  padding: 0.5rem;
+  border-radius: 4px;
+  white-space: normal;
+  word-wrap: break-word;
+}
+
+.evaluation-message-retry {
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  color: #ad6800;
+  background-color: #fff7e6;
+  padding: 0.5rem;
+  border-radius: 4px;
+  border: 1px dashed #ffd591;
+}
+
+.retry-label {
+  font-weight: 500;
+  color: #d48806;
+}
+
+/* Summary message styles */
+.message.summary {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.summary-message-box {
+  background-color: #f0f5ff;
+  border: 1px solid #adc6ff;
+  border-radius: 8px;
+  padding: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.summary-message-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.summary-message-icon {
+  font-size: 1rem;
+}
+
+.summary-message-label {
+  font-weight: 600;
+  color: #1d39c4;
+}
+
+.summary-message-content {
+  font-size: 0.85rem;
+  color: #434343;
+  background-color: #ffffff;
+  padding: 0.5rem;
+  border-radius: 4px;
+  white-space: normal;
+  word-wrap: break-word;
+  line-height: 1.5;
+}
+
+/* Markdown rendering styles */
+/* Use :deep() because content is rendered via v-html and scoped styles don't penetrate */
+.message-content :deep(h1),
+.message-content :deep(h2),
+.message-content :deep(h3),
+.message-content :deep(h4),
+.message-content :deep(h5),
+.message-content :deep(h6) {
+  margin: 0.75rem 0 0.35rem 0;
+  font-weight: 600;
+  line-height: 1.3;
+  color: #2d3748;
+}
+
+.message-content :deep(h1) { font-size: 1.25rem; }
+.message-content :deep(h2) { font-size: 1.15rem; }
+.message-content :deep(h3) { font-size: 1.05rem; }
+.message-content :deep(h4) { font-size: 1rem; }
+.message-content :deep(h5),
+.message-content :deep(h6) { font-size: 0.9rem; }
+
+.message-content :deep(p),
+.reasoning-content :deep(p),
+.summary-message-content :deep(p),
+.system-summary-content :deep(p) {
+  margin: 0.25rem 0;
+}
+
+.message-content :deep(ul),
+.message-content :deep(ol),
+.reasoning-content :deep(ul),
+.reasoning-content :deep(ol),
+.summary-message-content :deep(ul),
+.summary-message-content :deep(ol),
+.evaluation-message-reason :deep(ul),
+.evaluation-message-reason :deep(ol) {
+  margin: 0;
+  padding-left: 1rem;
+}
+
+.message-content :deep(li),
+.reasoning-content :deep(li),
+.summary-message-content :deep(li),
+.evaluation-message-reason :deep(li) {
+  margin: 0.25rem 0.25rem;
+}
+
+.message-content :deep(code),
+.reasoning-content :deep(code),
+.summary-message-content :deep(code) {
+  background-color: #edf2f7;
+  padding: 0.15rem 0.35rem;
+  border-radius: 3px;
+  font-family: monospace;
+  font-size: 0.9em;
+  color: #2d3748;
+}
+
+.message-content :deep(pre),
+.reasoning-content :deep(pre),
+.summary-message-content :deep(pre) {
+  background-color: #2d3748;
+  color: #e2e8f0;
+  padding: 0.75rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0.5rem 0;
+}
+
+.message-content :deep(pre code),
+.reasoning-content :deep(pre code),
+.summary-message-content :deep(pre code) {
+  background-color: transparent;
+  color: inherit;
+  padding: 0;
+  font-size: 0.85rem;
+}
+
+.message-content :deep(blockquote),
+.reasoning-content :deep(blockquote),
+.summary-message-content :deep(blockquote) {
+  border-left: 3px solid #cbd5e0;
+  margin: 0.5rem 0;
+  padding: 0.25rem 0.75rem;
+  color: #4a5568;
+  background-color: #f7fafc;
+}
+
+.message-content :deep(a),
+.reasoning-content :deep(a),
+.summary-message-content :deep(a) {
+  color: #3182ce;
+  text-decoration: none;
+}
+
+.message-content :deep(a:hover),
+.reasoning-content :deep(a:hover),
+.summary-message-content :deep(a:hover) {
+  text-decoration: underline;
+}
+
+.message-content :deep(strong),
+.reasoning-content :deep(strong),
+.summary-message-content :deep(strong) {
+  font-weight: 600;
+  color: #2d3748;
+}
+
+.message-content :deep(hr),
+.reasoning-content :deep(hr),
+.summary-message-content :deep(hr) {
+  border: none;
+  border-top: 1px solid #e2e8f0;
+  margin: 0.75rem 0;
+}
+
+.message-content :deep(table),
+.reasoning-content :deep(table),
+.summary-message-content :deep(table) {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.5rem 0;
+  font-size: 0.9rem;
+}
+
+.message-content :deep(th),
+.message-content :deep(td),
+.reasoning-content :deep(th),
+.reasoning-content :deep(td),
+.summary-message-content :deep(th),
+.summary-message-content :deep(td) {
+  border: 1px solid #e2e8f0;
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+}
+
+.message-content :deep(th),
+.reasoning-content :deep(th),
+.summary-message-content :deep(th) {
+  background-color: #edf2f7;
+  font-weight: 600;
 }
 </style>

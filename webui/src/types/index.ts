@@ -103,7 +103,7 @@ export interface UpdateUpstreamRequest {
 // === Chat Types ===
 
 export interface ChatMessage {
-  role: "user" | "assistant" | "system";
+  role: "user" | "assistant" | "system" | "tool" | "agent" | "evaluation" | "summary";
   content: string;
   reasoning?: string;  // Reasoning content (separate from main content)
   timestamp?: number;
@@ -112,9 +112,25 @@ export interface ChatMessage {
   showReasoning?: boolean; // Whether reasoning section is expanded (UI state)
   agentName?: string;  // Which agent generated this response (for multi-agent scenarios)
   agentChain?: string[];  // Delegation chain showing how this agent was reached (e.g., ["assistant", "researcher"])
-  // Tool execution state
-  toolExecution?: ToolExecutionState;
-  toolExecutionExpanded?: boolean; // Whether tool execution details are expanded (UI state)
+  agentDepth?: number;  // Nesting depth of this agent (0 = primary, 1 = sub-agent, etc.)
+  // Tool message fields (for role: "tool")
+  toolName?: string;  // Name of the tool being executed
+  toolCallId?: string;  // Unique ID for this tool call
+  toolStatus?: "pending" | "running" | "success" | "failed";  // Execution status
+  toolDuration?: number;  // Duration in milliseconds
+  toolArgs?: Record<string, unknown>;  // Arguments passed to the tool
+  toolResult?: string;  // Result preview or error message
+  // Agent delegation message fields (for role: "agent")
+  agentFrom?: string;  // Which agent delegated (parent agent)
+  agentTo?: string;  // Which agent was delegated to (child agent)
+  // Evaluation message fields (for role: "evaluation")
+  evalStatus?: "complete" | "incomplete" | "failed";  // Evaluation status
+  evalAgent?: string;  // Subagent being evaluated
+  evalReason?: string;  // Reason for the evaluation result
+  evalConfidence?: number;  // Confidence score (0.0 to 1.0)
+  evalRetryInstructions?: string;  // Retry instructions if incomplete
+  // Summary message fields (for role: "summary")
+  summaryAgent?: string;  // Subagent being summarized
 }
 
 // Tool event types
@@ -218,9 +234,36 @@ export type AgentEventType = "agent_start" | "agent_end";
 
 export interface AgentEvent {
   type: AgentEventType;
+  timestamp?: number;  // Event timestamp
   agent: string;  // Agent name
   depth?: number;  // Nesting depth (0 = primary agent, 1 = sub-agent, etc.)
   chain?: string[];  // Delegation chain (e.g., ["assistant", "researcher", "coder"])
+}
+
+// === Evaluation Types ===
+
+export type EvaluationEventType = "evaluation_start" | "evaluation_end" | "evaluation_result";
+
+export interface EvaluationEvent {
+  type: EvaluationEventType;
+  timestamp?: number;  // Event timestamp
+  agent?: string;  // Subagent being evaluated
+  status?: "complete" | "incomplete" | "failed";
+  reason?: string;
+  confidence?: number;  // Confidence score (0.0 to 1.0)
+  retry_instructions?: string;
+  summary_focus?: string;
+}
+
+// === Summary Types ===
+
+export type SummaryEventType = "summary_result";
+
+export interface SummaryEvent {
+  type: SummaryEventType;
+  timestamp?: number;  // Event timestamp
+  agent?: string;  // Subagent being summarized
+  content?: string;  // Summary content
 }
 
 export interface Agent {

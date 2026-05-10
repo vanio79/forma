@@ -45,6 +45,150 @@ from forma.tools import ToolExecutor, get_registry
 from forma.tools.executor import ToolExecutionEvent
 from forma.upstream_manager import UpstreamManager
 
+# === Semantic Block Helpers ===
+# These functions generate human-readable semantic blocks for API consumers.
+# Format: [BLOCK_TYPE: name]\nkey: value\n[/BLOCK_TYPE]
+# This format is self-documenting and can be displayed by any API consumer.
+
+
+def format_agent_start_block(agent_name: str, depth: int, chain: list[str]) -> str:
+    """Format a semantic block for agent start.
+
+    Args:
+        agent_name: Name of the agent starting
+        depth: Nesting depth (0 = primary, 1+ = subagent)
+        chain: Full delegation chain
+
+    Returns:
+        Human-readable semantic block string
+    """
+    chain_str = " → ".join(chain) if chain else agent_name
+    block = f"[AGENT_START: {agent_name}]\n"
+    block += f"depth: {depth}\n"
+    block += f"chain: {chain_str}\n"
+    block += f"[/AGENT_START]\n"
+    return block
+
+
+def format_agent_end_block(agent_name: str, depth: int, chain: list[str]) -> str:
+    """Format a semantic block for agent end.
+
+    Args:
+        agent_name: Name of the agent ending
+        depth: Nesting depth
+        chain: Full delegation chain
+
+    Returns:
+        Human-readable semantic block string
+    """
+    chain_str = " → ".join(chain) if chain else agent_name
+    block = f"[AGENT_END: {agent_name}]\n"
+    block += f"depth: {depth}\n"
+    block += f"chain: {chain_str}\n"
+    block += f"[/AGENT_END]\n"
+    return block
+
+
+def format_tool_start_block(tool_name: str, tool_id: str, arguments: dict[str, Any]) -> str:
+    """Format a semantic block for tool call start.
+
+    Args:
+        tool_name: Name of the tool being called
+        tool_id: Unique tool call ID
+        arguments: Arguments passed to the tool
+
+    Returns:
+        Human-readable semantic block string
+    """
+    block = f"[TOOL_START: {tool_name}]\n"
+    block += f"id: {tool_id}\n"
+    block += f"status: running\n"
+    if arguments:
+        # Format arguments as readable JSON
+        args_str = json.dumps(arguments, ensure_ascii=False)
+        block += f"args: {args_str}\n"
+    block += f"[/TOOL_START]\n"
+    return block
+
+
+def format_tool_end_block(
+    tool_name: str,
+    tool_id: str,
+    success: bool,
+    duration_ms: float,
+    result_preview: str | None = None,
+) -> str:
+    """Format a semantic block for tool call end.
+
+    Args:
+        tool_name: Name of the tool
+        tool_id: Unique tool call ID
+        success: Whether execution succeeded
+        duration_ms: Execution duration in milliseconds
+        result_preview: Preview of result or error message
+
+    Returns:
+        Human-readable semantic block string
+    """
+    status = "success" if success else "failed"
+    block = f"[TOOL_END: {tool_name}]\n"
+    block += f"id: {tool_id}\n"
+    block += f"status: {status}\n"
+    block += f"duration: {duration_ms:.1f}ms\n"
+    if result_preview:
+        # Truncate long results for readability
+        preview = result_preview[:200] if len(result_preview) > 200 else result_preview
+        block += f"result: {preview}\n"
+    block += f"[/TOOL_END]\n"
+    return block
+
+
+def format_evaluation_block(
+    agent_name: str,
+    status: str,
+    reason: str,
+    confidence: float,
+    retry_instructions: str | None = None,
+) -> str:
+    """Format a semantic block for evaluation result.
+
+    Args:
+        agent_name: Name of the subagent being evaluated
+        status: Evaluation status (complete, incomplete, failed)
+        reason: Reason for the evaluation result
+        confidence: Confidence score (0.0 to 1.0)
+        retry_instructions: Instructions for retry if incomplete
+
+    Returns:
+        Human-readable semantic block string
+    """
+    confidence_pct = int(confidence * 100)
+    block = f"[EVALUATION: {agent_name}]\n"
+    block += f"status: {status}\n"
+    block += f"confidence: {confidence_pct}%\n"
+    block += f"reason: {reason}\n"
+    if retry_instructions:
+        block += f"retry_instructions: {retry_instructions}\n"
+    block += f"[/EVALUATION]\n"
+    return block
+
+
+def format_summary_block(agent_name: str, content: str) -> str:
+    """Format a semantic block for subagent summary.
+
+    Args:
+        agent_name: Name of the subagent
+        content: Summary content
+
+    Returns:
+        Human-readable semantic block string
+    """
+    block = f"[SUMMARY: {agent_name}]\n"
+    block += f"content: {content}\n"
+    block += f"[/SUMMARY]\n"
+    return block
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -679,17 +823,29 @@ async def _execute_agent_request_streaming(
     messages: list[dict[str, Any]],
     user_message: str,
     original_payload: dict[str, Any],
+    depth: int = 0,
+    chain: list[str] | None = None,
+    retry_attempt: int = 0,
+    retry_instructions: str | None = None,
 ) -> StreamingResponse:
     """Execute a streaming request for a specific agent with tool execution.
 
     Uses agent's configuration: upstream, instruction prompt, tool settings.
     Executes tool loop if tools are enabled for the agent and streams tool events.
 
+    Caller controls AGENT_END before this function to create a visual break.
+    This function always emits AGENT_START after tool execution to open
+    a new message for the response.
+
     Args:
         agent: Agent configuration dict
         messages: Original messages array
         user_message: The message to send to this agent (extracted from user role)
         original_payload: Original request payload
+        depth: Nesting depth of this agent (0 = primary, 1 = sub-agent)
+        chain: Delegation chain (e.g., ["assistant", "researcher"])
+        retry_attempt: Retry attempt number (0 = first attempt, >0 = retry)
+        retry_instructions: Evaluator guidance for retry (if retry_attempt > 0)
 
     Returns:
         StreamingResponse from upstream (after tool execution if applicable)
@@ -896,9 +1052,18 @@ async def _execute_agent_request_streaming(
     # Create streaming response generator
     final_payload_template = payload_without_tools.copy()
     model_name = final_payload_template.get("model", "unknown")
+    agent_name = agent.get("name", "unknown")
+    agent_chain = chain if chain else [agent_name]
 
     async def stream_generator_wrapper():
-        """Wrapper that executes tool loop and streams events in parallel."""
+        """Wrapper that executes tool loop and streams events in parallel.
+
+        Creates visual breaks in the chat UI:
+        - Caller emits AGENT_END before calling this function (so tool boxes appear separately)
+        - This function streams tool events (separate boxes)
+        - This function emits AGENT_START after tool execution (new message for tool results)
+        - This function streams the final response into the new message
+        """
         # Start tool execution in parallel
         tool_task = asyncio.create_task(
             agent_tool_executor.execute_loop(
@@ -910,7 +1075,7 @@ async def _execute_agent_request_streaming(
             )
         )
 
-        # Stream events from the real-time generator
+        # Stream events from the real-time generator (tool boxes)
         async for chunk in _stream_with_realtime_events(
             event_queue=event_queue,
             model=model_name,
@@ -923,12 +1088,36 @@ async def _execute_agent_request_streaming(
         # Log tool execution
         if tool_result.has_tool_calls():
             logger.info(
-                f"Agent @{agent.get('name')} tool execution complete: "
+                f"Agent @{agent_name} tool execution complete: "
                 f"{len(tool_result.tool_calls)} calls, {tool_result.iterations} iterations, "
                 f"{tool_result.total_tool_time_ms:.1f}ms total"
             )
             if tool_result.max_iterations_reached:
-                logger.warning(f"Agent @{agent.get('name')} reached max iterations limit")
+                logger.warning(f"Agent @{agent_name} reached max iterations limit")
+
+        # Emit AGENT_START to open a new message for the tool results/response
+        # This creates a new assistant message box in the UI
+        start_block = format_agent_start_block(agent_name, depth, agent_chain)
+        yield start_block.encode()
+        logger.debug(f"Emitted AGENT_START after tool execution for @{agent_name}")
+
+        # Emit retry indicator text AFTER AGENT_START (so it streams into the open message)
+        # This is sent as SSE JSON so it appears in the chat as regular content
+        # Doing this here ensures the message is open and the text is properly displayed
+        if retry_attempt > 0:
+            retry_msg = f"\n🔄 **Retry attempt {retry_attempt}** for @{agent_name}\n"
+            retry_msg += f"Guidance from evaluator: {retry_instructions or 'N/A'}\n"
+            retry_sse = {
+                "choices": [
+                    {
+                        "delta": {"role": "assistant", "content": retry_msg},
+                        "finish_reason": None,
+                        "index": 0,
+                    }
+                ]
+            }
+            yield f"data: {json.dumps(retry_sse)}\n\n".encode()
+            logger.info(f"Sent retry indicator for @{agent_name} attempt {retry_attempt}")
 
         # Stream the final response with the actual messages
         if tool_result.final_messages:
@@ -1731,19 +1920,31 @@ async def _stream_route_to_agents(
 ) -> StreamingResponse:
     """Route message to mentioned agents sequentially with streaming and agent-to-agent support.
 
-    Each agent's response is streamed with markers:
-    __AGENT_START__{"agent": "name", "depth": N, "chain": ["agent1", "agent2"]}__END__
+    Each agent's response is streamed with semantic blocks:
+    [AGENT_START: name]
+    depth: N
+    chain: agent1 → agent2
+    [/AGENT_START]
     [streaming content]
-    __AGENT_END__{"agent": "name", "depth": N, "chain": ["agent1", "agent2"]}__END__
+    [AGENT_END: name]
+    depth: N
+    chain: agent1 → agent2
+    [/AGENT_END]
 
     For subagents (depth > 0), after streaming completes:
-    __EVALUATION__{"status": "...", "reason": "..."}__END__
-    __SUMMARY__{"content": "..."}__END__
+    [EVALUATION: name]
+    status: complete/incomplete/failed
+    confidence: 85%
+    reason: ...
+    [/EVALUATION]
+    [SUMMARY: name]
+    content: ...
+    [/SUMMARY]
 
     After each agent completes, checks for mentions of other agents.
     If mentions found and depth < max_depth, recursively streams sub-agent responses.
 
-    Note: Streaming doesn support retry loop. Evaluation happens after stream ends.
+    Note: Streaming doesn't support retry loop. Evaluation happens after stream ends.
     If evaluator says incomplete, a marker is sent but retry happens on next request.
 
     Args:
@@ -1783,7 +1984,13 @@ async def _stream_route_to_agents(
             is_subagent_delegation = depth > 0
 
             # Get task description for evaluation
-            task_description = _get_user_prompt(messages)
+            # For subagent delegations, the actual task is the delegation message
+            # (what the subagent was asked to do), not the original user prompt.
+            if is_subagent_delegation and messages:
+                # The last message is the assistant's delegation instruction
+                task_description = messages[-1].get("content", _get_user_prompt(messages))
+            else:
+                task_description = _get_user_prompt(messages)
 
             # Retry loop for evaluation
             evaluation_attempts = 0
@@ -1791,11 +1998,14 @@ async def _stream_route_to_agents(
             final_streamed_content = ""
 
             while evaluation_attempts <= max_evaluation_retries:
-                # Send agent start marker with chain (only on first attempt)
-                if evaluation_attempts == 0:
-                    chain_json = json.dumps(current_chain)
-                    start_marker = f'__AGENT_START__{{"agent": "{agent_name}", "depth": {depth}, "chain": {chain_json}}}__END__\n'
-                    yield start_marker.encode()
+                # Send agent start block ONLY for retry attempts
+                # For first attempt, AGENT_START is sent after tool execution (inside _execute_agent_request_streaming)
+                # For retry, AGENT_START is sent after evaluation (below), then AGENT_END before tools (below)
+                if evaluation_attempts > 0:
+                    # This is a retry - AGENT_START was already sent after evaluation
+                    # We need to send AGENT_END before tool execution to close the empty retry message
+                    # Then tools will appear separately, and AGENT_START will be sent after tools
+                    pass  # AGENT_END will be sent before _execute_agent_request_streaming
 
                 # Prepare messages for execution
                 if is_subagent_delegation:
@@ -1822,22 +2032,6 @@ async def _stream_route_to_agents(
                         )
                         execution_messages = retry_messages
 
-                        # Send retry indicator to user
-                        retry_msg = (
-                            f"\n🔄 **Retry attempt {evaluation_attempts}** for @{agent_name}\n"
-                        )
-                        retry_msg += f"Guidance from evaluator: {evaluation_result.retry_instructions if evaluation_result else 'N/A'}\n"
-                        retry_sse = {
-                            "choices": [
-                                {
-                                    "delta": {"role": "assistant", "content": retry_msg},
-                                    "finish_reason": None,
-                                    "index": 0,
-                                }
-                            ]
-                        }
-                        yield f"data: {json.dumps(retry_sse)}\n\n".encode()
-
                         logger.info(
                             f"Created retry context (attempt #{evaluation_attempts}) for @{agent_name}"
                         )
@@ -1847,12 +2041,33 @@ async def _stream_route_to_agents(
                 # Get the actual user message for RAG query
                 actual_user_msg = _get_user_prompt(execution_messages)
 
+                # Send AGENT_END before tool execution ONLY for retry attempts
+                # For first attempt: no AGENT_START was sent, so no AGENT_END needed
+                # For retry: AGENT_START was sent after evaluation, so we need AGENT_END to close it
+                # This creates a break so tool boxes appear as separate UI elements
+                if evaluation_attempts > 0:
+                    end_block_before_tools = format_agent_end_block(
+                        agent_name, depth, current_chain
+                    )
+                    yield end_block_before_tools.encode()
+                    logger.debug(
+                        f"Emitted AGENT_END before tool execution for @{agent_name} (retry attempt {evaluation_attempts})"
+                    )
+
                 # Execute agent request (streaming)
+                # Always send AGENT_START after tools (send_agent_start=True, default)
+                # Pass retry context so retry indicator is emitted after AGENT_START
                 response = await _execute_agent_request_streaming(
                     agent=agent,
                     messages=execution_messages,
                     user_message=actual_user_msg,
                     original_payload=original_payload,
+                    depth=depth,
+                    chain=current_chain,
+                    retry_attempt=evaluation_attempts,
+                    retry_instructions=evaluation_result.retry_instructions
+                    if evaluation_result
+                    else None,
                 )
 
                 # Stream the agent's response and collect content
@@ -1915,6 +2130,14 @@ async def _stream_route_to_agents(
                     )
 
                     if should_eval:
+                        # Send AGENT_END to close the current message before evaluation
+                        # This creates a break so evaluation box appears separately
+                        end_block_before_eval = format_agent_end_block(
+                            agent_name, depth, current_chain
+                        )
+                        yield end_block_before_eval.encode()
+                        logger.debug(f"Emitted AGENT_END before evaluation for @{agent_name}")
+
                         # Evaluate the streamed response
                         evaluation_result = await _evaluate_subagent_response(
                             task_description=task_description,
@@ -1924,49 +2147,15 @@ async def _stream_route_to_agents(
                             original_payload=original_payload,
                         )
 
-                        # Send evaluation as visible text in the chat (SSE format)
-                        status_emoji = {"complete": "✅", "incomplete": "⚠️", "failed": "❌"}.get(
-                            evaluation_result.status, "📋"
+                        # Send evaluation block for frontend to display as a separate box
+                        eval_block = format_evaluation_block(
+                            agent_name=agent_name,
+                            status=evaluation_result.status,
+                            reason=evaluation_result.reason,
+                            confidence=evaluation_result.confidence,
+                            retry_instructions=evaluation_result.retry_instructions,
                         )
-
-                        eval_visible = f"\n\n---\n**{status_emoji} EVALUATION of @{agent_name}** (attempt {evaluation_attempts + 1})\n"
-                        eval_visible += f"**Status:** {evaluation_result.status} ({int(evaluation_result.confidence * 100)}% confidence)\n"
-                        eval_visible += f"**Reason:** {evaluation_result.reason}\n"
-                        if evaluation_result.retry_instructions:
-                            eval_visible += (
-                                f"**Retry Instructions:** {evaluation_result.retry_instructions}\n"
-                            )
-                        if evaluation_result.summary_focus:
-                            eval_visible += (
-                                f"**Summary Focus:** {evaluation_result.summary_focus}\n"
-                            )
-                        eval_visible += "---\n"
-
-                        # Wrap in SSE format for UI to display
-                        eval_sse = {
-                            "choices": [
-                                {
-                                    "delta": {"role": "assistant", "content": eval_visible},
-                                    "finish_reason": None,
-                                    "index": 0,
-                                }
-                            ]
-                        }
-                        yield f"data: {json.dumps(eval_sse)}\n\n".encode()
-
-                        # Also send the marker for internal processing
-                        eval_marker_data = {
-                            "status": evaluation_result.status,
-                            "reason": evaluation_result.reason,
-                            "confidence": evaluation_result.confidence,
-                        }
-                        if evaluation_result.retry_instructions:
-                            eval_marker_data["retry_instructions"] = (
-                                evaluation_result.retry_instructions
-                            )
-
-                        eval_marker = f"__EVALUATION__{json.dumps(eval_marker_data)}__END__\n"
-                        yield eval_marker.encode()
+                        yield eval_block.encode()
 
                         # Log full evaluation details
                         logger.info(
@@ -1990,18 +2179,10 @@ async def _stream_route_to_agents(
                         ):
                             evaluation_attempts += 1
 
-                            # Send retry attempt message to UI immediately
-                            retry_message = f"\n\n🔄 **Retrying @{agent_name}** (attempt {evaluation_attempts}/{max_evaluation_retries})...\n\n"
-                            retry_sse = {
-                                "choices": [
-                                    {
-                                        "delta": {"role": "assistant", "content": retry_message},
-                                        "finish_reason": None,
-                                        "index": 0,
-                                    }
-                                ]
-                            }
-                            yield f"data: {json.dumps(retry_sse)}\n\n".encode()
+                            # Don't send AGENT_START here - it would create an empty message
+                            # that gets closed by AGENT_END before tools. The retry message
+                            # will be properly opened by _execute_agent_request_streaming
+                            # after tool execution completes.
 
                             logger.info(
                                 f"Evaluator says @{agent_name} incomplete (attempt {evaluation_attempts}), "
@@ -2031,35 +2212,19 @@ async def _stream_route_to_agents(
                     original_payload=original_payload,
                 )
 
-                summary_visible = (
-                    f"\n**📝 SUMMARY for calling agent @{calling_agent_name}:** {summary}\n"
-                )
-                # Wrap in SSE format for UI to display
-                summary_sse = {
-                    "choices": [
-                        {
-                            "delta": {"role": "assistant", "content": summary_visible},
-                            "finish_reason": None,
-                            "index": 0,
-                        }
-                    ]
-                }
-                yield f"data: {json.dumps(summary_sse)}\n\n".encode()
-
-                # Also send marker for internal processing
-                summary_marker = f"__SUMMARY__{json.dumps({'content': summary})}__END__\n"
-                yield summary_marker.encode()
+                # Send summary block for internal processing
+                summary_block = format_summary_block(agent_name, summary)
+                yield summary_block.encode()
 
                 logger.info(f"Full summary for @{agent_name}: {summary}")
-                logger.info(f"Sent evaluation and summary markers for @{agent_name}")
+                logger.info(f"Sent evaluation and summary blocks for @{agent_name}")
 
                 # Store summary for potential use by calling agent
                 agent_streams_data[f"{agent_name}_summary"] = summary
 
-            # Send agent end marker with chain
-            chain_json = json.dumps(current_chain)
-            end_marker = f'__AGENT_END__{{"agent": "{agent_name}", "depth": {depth}, "chain": {chain_json}}}__END__\n'
-            yield end_marker.encode()
+            # Send agent end block
+            end_block = format_agent_end_block(agent_name, depth, current_chain)
+            yield end_block.encode()
 
             # Check for agent-to-agent mentions in the streamed content
             mentioned_agents = _check_response_for_mentions(final_streamed_content)
@@ -2451,6 +2616,7 @@ async def chat_completions(request: Request) -> dict[str, Any] | StreamingRespon
                     final_payload["stream"] = True
 
                     response = await proxy.chat_completions(final_payload)
+
                     if isinstance(response, StreamingResponse):
                         async for chunk in response.body_iterator:
                             yield chunk

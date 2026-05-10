@@ -269,17 +269,33 @@ For multi-agent responses:
 
 ### Streaming with Multi-Agent
 
-For streaming requests, each agent's response is streamed with markers:
+For streaming requests, each agent's response is streamed with semantic blocks:
 
 ```
-__AGENT_START__{"agent": "researcher", "depth": 0}__END__
+[AGENT_START: researcher]
+depth: 1
+chain: assistant → researcher
+[/AGENT_START]
 [streaming content from researcher]
-__AGENT_END__{"agent": "researcher", "depth": 0}__END__
+[AGENT_END: researcher]
+depth: 1
+chain: assistant → researcher
+[/AGENT_END]
 
-__AGENT_START__{"agent": "coder", "depth": 1}__END__
+[AGENT_START: coder]
+depth: 2
+chain: assistant → researcher → coder
+[/AGENT_START]
 [streaming content from coder]
-__AGENT_END__{"agent": "coder", "depth": 1}__END__
+[AGENT_END: coder]
+depth: 2
+chain: assistant → researcher → coder
+[/AGENT_END]
 ```
+
+The frontend uses a two-pass parser:
+1. **First pass**: Parse raw buffer for semantic blocks (AGENT_START/END, EVALUATION, SUMMARY)
+2. **Second pass**: Parse remaining buffer as JSON SSE lines for content streaming
 
 ### Database Schema
 
@@ -386,14 +402,21 @@ async def agent_chat_completions(agent_name: str, request: Request):
 
 ### Web UI
 
-Add Agents page to Web UI:
-
+**Agents Management Page:**
 - List all agents with status (enabled/disabled)
 - Create/edit/delete agents
 - View agent instruction prompt
 - Test agent with sample message
 - View agent's upstream configuration
 - View agent's tool whitelist
+
+**Chat Page Features:**
+- **Agent chain headers**: `🤖 @assistant → @researcher` shown above all agent-related boxes
+- **Standalone tool boxes**: Each tool call appears as a separate blue box with name, args, status, duration
+- **Evaluation boxes**: Yellow boxes showing evaluator status, confidence, reason, retry instructions
+- **Summary boxes**: Blue boxes with semi-structured summarizer output
+- **Markdown rendering**: All content rendered via `marked` + `DOMPurify`
+- **Activity indicator**: Bouncing dots during silent streaming periods
 
 ### Integration with Existing Features
 
@@ -616,18 +639,28 @@ Automatic compaction triggers at 90% of context window (34560 tokens for 38400 w
 - Iterative: For single large messages (>1500 chars), chunk and summarize progressively
 
 **SSE Evaluation Events:**
-```typescript
-interface EvalEvent {
-  type: "evaluation_start" | "evaluation_result" | "retry_attempt";
-  subagent?: string;
-  status?: string;
-  reason?: string;
-  attempt?: number;
-  max_attempts?: number;
-}
+
+Evaluations are sent as semantic blocks after AGENT_END:
+
+```
+[AGENT_END: researcher]
+depth: 1
+chain: assistant → researcher
+[/AGENT_END]
+
+[EVALUATION: researcher]
+status: incomplete
+confidence: 50%
+reason: Need full recipe details
+retry_instructions: Use web_fetch to get article content
+[/EVALUATION]
 ```
 
-Events streamed as: `__EVAL_EVENT__{json}__END__`
+The frontend `blockToEvaluationEvent()` parser extracts:
+- `status`: complete | incomplete | failed
+- `reason`: Evaluator's explanation
+- `confidence`: 0.0-1.0 (parsed from percentage string)
+- `retry_instructions`: Specific guidance for retry
 
 **Example Retry Sequence:**
 ```
@@ -704,37 +737,45 @@ Efficiency analysis: Uses Python's built-in sorted(), which is O(n log n)...
 ```
 User: "@assistant find a recipe for циганска баница"
 
-Response:
---- [@assistant]
-Delegating to @researcher: Find a recipe for циганска баница
+UI Display:
+🤖 @assistant
+[Assistant delegates to researcher]
 
---- [@researcher] (Attempt 1)
-I found several search results mentioning циганска баница:
-- https://example.com/recipe1
-- https://example.com/recipe2
+🤖 @assistant → @researcher
+🔧 search_web  850ms
+{"query": "циганска баница recipe"}
+Found 5 search results...
 
-[Evaluation: incomplete (95%) - need full recipe details]
-[Retry guidance: Use web_fetch to get article content]
+⚠ Evaluation @researcher  50% confidence
+Need full recipe details
+Retry: Use web_fetch to get article content
 
---- [@researcher] (Attempt 2)
-I fetched the article. It mentions traditional Bulgarian pastry...
-[Evaluation: incomplete (90%) - missing ingredients/instructions]
-[Retry guidance: Parse and extract recipe details]
+🤖 @assistant → @researcher
+🔧 web_fetch  1200ms
+{"url": "https://example.com/recipe1"}
+Fetched article content...
 
---- [@researcher] (Attempt 3)
-Recipe for циганска баница:
-Ingredients: filo dough, eggs, yogurt, cheese, butter...
-Instructions: 1. Layer filo sheets, 2. Mix filling...
+⚠ Evaluation @researcher  45% confidence
+Missing ingredients/instructions
+Retry: Parse and extract recipe details
 
-[Evaluation: complete (85%)]
+🤖 @assistant → @researcher
+[Response with full recipe details]
 
---- [@summarizer]
-Summary: Found traditional Bulgarian циганска баница recipe with filo dough, 
-cheese filling, and step-by-step layering instructions.
+✓ Evaluation @researcher  85% confidence
+Task complete with actionable recipe
 
---- [@assistant]
-Here's the recipe for циганска баница that @researcher found:
-[recipe details from summary]
+📝 Summary @researcher
+### Original Task
+Find a recipe for циганска баница
+### Key Findings
+- Traditional Bulgarian pastry
+- Ingredients: filo dough, eggs, yogurt, cheese, butter
+### Conclusions
+Recipe found with step-by-step instructions
+
+🤖 @assistant
+Here's the recipe for циганска баница that @researcher found...
 ```
 
 The meta-agent evaluation system ensures:

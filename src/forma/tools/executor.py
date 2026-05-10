@@ -1,4 +1,21 @@
-"""Tool execution loop for server-side tool calling."""
+"""Tool execution loop for server-side tool calling.
+
+Uses semantic block format for tool events:
+[TOOL_START: tool_name]
+id: call_id
+status: running
+args: {"key": "value"}
+[/TOOL_START]
+
+[TOOL_END: tool_name]
+id: call_id
+status: success/failed
+duration: 123ms
+result: preview...
+[/TOOL_END]
+
+This format is human-readable and self-documenting for API consumers.
+"""
 
 import asyncio
 import json
@@ -37,14 +54,57 @@ class ToolExecutionEvent:
         """Convert event to OpenAI content delta format (for standard OpenAI clients).
 
         Returns content that can be embedded in choices[0].delta.content
-        Uses a special marker format: __TOOL_EVENT__{json}__END__
+        Uses semantic block format: [TOOL_START/END: name]...[/TOOL_START/END]
         so the UI can detect and parse tool events separately from regular content.
+        This format is human-readable and self-documenting.
         """
-        # Create a structured JSON that the UI can parse
         event_data = {"type": self.event_type, "timestamp": self.timestamp, **self.data}
-        # Use special markers so UI can detect and extract tool events
-        # Do NOT include newlines here - they will be added by SSE protocol
-        return f"__TOOL_EVENT__{json.dumps(event_data)}__END__"
+
+        if self.event_type == "tool_call_start":
+            # Tool call start
+            tool_name = self.data.get("name", "unknown")
+            tool_id = self.data.get("id", "")
+            args = self.data.get("arguments", {})
+            args_str = json.dumps(args, ensure_ascii=False) if args else "{}"
+            return f"[TOOL_START: {tool_name}]\nid: {tool_id}\nstatus: running\nargs: {args_str}\n[/TOOL_START]"
+
+        elif self.event_type == "tool_call_end":
+            # Tool call end
+            tool_name = self.data.get("name", "unknown")
+            tool_id = self.data.get("id", "")
+            success = self.data.get("success", False)
+            duration_ms = self.data.get("duration_ms", 0)
+            result_preview = self.data.get("result_preview", "")
+            status = "success" if success else "failed"
+            # Truncate result preview for readability
+            preview = result_preview[:200] if result_preview else ""
+            return f"[TOOL_END: {tool_name}]\nid: {tool_id}\nstatus: {status}\nduration: {duration_ms:.1f}ms\nresult: {preview}\n[/TOOL_END]"
+
+        elif self.event_type == "tool_loop_complete":
+            # Tool loop complete - emit as a simple marker
+            total_calls = self.data.get("total_tool_calls", 0)
+            total_time = self.data.get("total_tool_time_ms", 0)
+            iterations = self.data.get("iterations", 0)
+            return f"[TOOL_LOOP_COMPLETE]\niterations: {iterations}\ntotal_calls: {total_calls}\ntotal_time: {total_time:.1f}ms\n[/TOOL_LOOP_COMPLETE]"
+
+        elif self.event_type == "tool_loop_progress":
+            # Tool loop progress
+            iteration = self.data.get("iteration", 0)
+            max_iterations = self.data.get("max_iterations", 0)
+            return f"[TOOL_PROGRESS]\niteration: {iteration}/{max_iterations}\n[/TOOL_PROGRESS]"
+
+        elif self.event_type == "tool_calls_received":
+            # Tool calls received
+            count = self.data.get("count", 0)
+            tools = self.data.get("tools", [])
+            tools_str = ", ".join(t.get("name", "?") for t in tools) if tools else ""
+            return (
+                f"[TOOL_CALLS_RECEIVED]\ncount: {count}\ntools: {tools_str}\n[/TOOL_CALLS_RECEIVED]"
+            )
+
+        else:
+            # Generic fallback for unknown event types
+            return f"[TOOL_EVENT]\ntype: {self.event_type}\ndata: {json.dumps(event_data)}\n[/TOOL_EVENT]"
 
 
 @dataclass

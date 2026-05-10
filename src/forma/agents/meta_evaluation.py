@@ -234,14 +234,37 @@ def format_summarizer_input(
         Formatted prompt for summarizer
     """
     return (
-        f"Summarize this subagent's work:\n\n"
-        f"Task: {task_description}\n\n"
+        f"Summarize this subagent's work. Preserve ALL information relevant to the original task.\n\n"
+        f"Original task: {task_description}\n\n"
         f"Subagent: @{subagent_name}\n\n"
         f"Evaluator assessment: {evaluator_assessment.status} "
         f"(reason: {evaluator_assessment.reason})\n\n"
         f"Full context:\n{full_context}\n\n"
-        f"Provide a concise summary (50-200 tokens) focusing on "
-        f"what the calling agent needs to know."
+        f"Instructions:\n"
+        f"1. Start by restating the original task so the calling agent knows what was requested.\n"
+        f"2. Preserve ALL facts, data, findings, and conclusions relevant to the original task.\n"
+        f"3. Keep specific details: names, dates, numbers, URLs, results. Do NOT omit them.\n"
+        f"4. Use bullet lists and short statements. Do NOT write flowing paragraphs.\n"
+        f"5. If the task was incomplete, say what was accomplished and what remains.\n"
+        f"6. Prioritize completeness over brevity.\n\n"
+        f"Return your summary using these sections (skip any section that has no content):\n\n"
+        f"### Original Task\n"
+        f"[Write the original task here]\n\n"
+        f"### What Was Done\n"
+        f"- [List each step the subagent took]\n"
+        f"- [...]\n\n"
+        f"### Key Findings / Results\n"
+        f"- [List each finding with all specific details preserved]\n"
+        f"- [...]\n\n"
+        f"### Data / Evidence\n"
+        f"- [List specific data: numbers, dates, names, URLs, quotes]\n"
+        f"- [...]\n\n"
+        f"### Conclusions / Answers\n"
+        f"- [Direct answer to the original task]\n"
+        f"- [...]\n\n"
+        f"### Incomplete Items\n"
+        f"- [Only include this section if something remains undone]\n"
+        f"- [...]"
     )
 
 
@@ -254,22 +277,11 @@ def extract_summary(response_content: str) -> str:
     Returns:
         Clean summary text
     """
-    # Look for "Summary:" prefix
     content = response_content.strip()
 
+    # Remove legacy "Summary:" prefix if present
     if content.lower().startswith("summary:"):
-        return content[8:].strip()  # Remove "Summary:" prefix
-
-    # If no prefix, just return the content (hopefully it's already a summary)
-    # Limit to prevent overly long summaries
-    if len(content) > 300:
-        logger.warning(f"Summary too long ({len(content)} chars), truncating")
-        # Try to find a good break point
-        for end_marker in ["\n\n", ". ", "\n"]:
-            pos = content.rfind(end_marker, 200, 280)
-            if pos > 0:
-                return content[: pos + 1].strip()
-        return content[:250] + "..."
+        content = content[8:].strip()
 
     return content
 
